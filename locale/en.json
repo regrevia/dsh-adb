@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Device Debug (ADB)",
+    "description": "Read and drive a connected Android device through its UI text tree instead of screenshots: dump, tap by text/id, wait for changes, logcat, install/start/stop apps, screenshot only on demand."
+  }
+}

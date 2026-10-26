@@ -1,0 +1,10 @@
+# dsh-adb 的 bundle patch：只插入一行插件，不动 profile 里的其它任何东西。
+#
+# 可选 config（一般不用写，默认自动选设备）：
+#   serial: '<serial>'   # 固定设备序列号；不写则用 ANDROID_SERIAL 或 adb devices 里第一个 online 设备
+#   adb: '/opt/homebrew/bin/adb'
+#
+# 需要替代截图主循环时不写 config 即可：设备插上就能用。
+- insert:
+    - id: adb
+      name: dsh-adb

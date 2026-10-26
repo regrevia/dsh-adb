@@ -1,0 +1,57 @@
+{
+  "name": "dsh-adb",
+  "version": "0.8.0",
+  "private": false,
+  "description": "真机调试插件：界面文本树、动效数据、实时画面侧栏与圈选标注",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./mirror": "./mirror.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "mirror.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "vendor",
+    "README.md",
+    "selftest.mjs"
+  ],
+  "license": "MIT",
+  "author": "dsh-adb contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-name/dsh-adb"
+  },
+  "homepage": "https://github.com/your-name/dsh-adb#readme",
+  "bugs": {
+    "url": "https://github.com/your-name/dsh-adb/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "adb",
+    "android",
+    "uiautomator",
+    "mirror",
+    "debugging"
+  ]
+}

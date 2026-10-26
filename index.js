@@ -2313,7 +2313,7 @@ export function apply(ctx, config) {
         return {
           summary: [
             `已请求在「实时ADB」侧栏打开（${opened} 个页面收到）· ${device}`,
-            '栏没出现就切到本会话再叫一次',
+            '页签已建在本会话右栏，回到本会话自动展开',
             state.live ? `画面在直播，约 ${state.fps} 帧/秒` : '画面正在起，几秒后出现',
             `本机缓冲 ${state.bufferedSeconds ?? 0}s`,
           ].join(' · '),

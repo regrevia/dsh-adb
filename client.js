@@ -533,11 +533,13 @@ window.__ModuleLoader__.load({
               wantTries = 0
             }
             const mounted = mountedNow()
-            /* 默认拒绝：只有「右栏正挂在发起方这一栏上」才允许占用可见栏。
-               会话未知（undefined）不是许可，先短等右栏挂上来，挂的不是这一栏就彻底放弃。 */
+            /* 空串和 undefined 一样，都是「右栏没挂上任何会话」：右栏收起时就是这个值。
+               这不是许可，但也不该立刻放弃——挂上来只需要几十毫秒，等一下再看。 */
+            const blank = mounted === undefined || mounted === null || mounted === ''
+            /* 默认拒绝：只有「右栏正挂在发起方这一栏上」才允许占用可见栏。 */
             if (mounted !== want) {
-              report({ event: 'want-skip', mounted: mounted === undefined ? 'undefined' : String(mounted).slice(-8), want: String(want).slice(-8) })
-              if (mounted === undefined && wantTries < 20) {
+              report({ event: 'want-skip', mounted: blank ? 'blank' : String(mounted).slice(-8), want: String(want).slice(-8) })
+              if (blank && wantTries < 20) {
                 wantTries += 1
                 clearTimeout(retry)
                 retry = setTimeout(() => { onWanted({ data: JSON.stringify(body) }, true) }, 250)
@@ -545,6 +547,12 @@ window.__ModuleLoader__.load({
               return
             }
             const pane = right()
+            if (apiLogged === false) {
+              apiLogged = true
+              try {
+                report({ event: 'api', methods: Object.getOwnPropertyNames(Object.getPrototypeOf(pane ?? {})).slice(0, 40) })
+              } catch { /* 探不到就算了 */ }
+            }
             if (rowsOf(want).some((row) => row.kind === KIND) === false) {
               try { pane?.openTab?.(KIND) } catch { /* 页签被拒：下一跳再看 */ }
             }
@@ -560,6 +568,7 @@ window.__ModuleLoader__.load({
           /* 短等右栏挂上的重试要有限度：每次 onWanted 只排一次，靠 at 去重挡重复请求。 */
           let seenWantAt = 0
           let wantTries = 0
+          let apiLogged = false
           let retry
           let source
           try {

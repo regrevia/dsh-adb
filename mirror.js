@@ -37,7 +37,7 @@ const LIVE_FPS = 4
 /** 往外送帧的节奏：并发截图是一股一股完成的，按固定节拍取最新一帧才顺。 */
 const PUSH_TICK_MS = 200
 /** 同时在飞的截图数：单张约 0.65s，3 张并发实测 4 帧/秒以上。 */
-const CAPTURE_PARALLEL = 3
+const CAPTURE_PARALLEL = 2
 
 /** 环形缓冲：10 秒一段，留 18 段 ≈ 3 分钟，超出的由 ffmpeg 自己覆盖。 */
 const SEGMENT_SECONDS = 10
@@ -86,17 +86,25 @@ export function frameSize(jpeg) {
 /** PNG 文件头。 */
 const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
+/** JPEG 文件头。 */
+const JPEG_SIG = Buffer.from([0xff, 0xd8, 0xff])
+
+/** 设备端截图落点：同一台设备只留一份，覆盖写。 */
+const LIVE_SHOT = '/data/local/tmp/.dsh-adb-live.jpg'
+
 /**
  * 一张 PNG 转成 JPEG：/live 走 MJPEG，帧只能是 JPEG。
  * @param {Buffer} png - PNG 数据。
  * @returns {Promise<Buffer | null>} JPEG，失败时 null。
  */
 function pngToJpeg(png) {
+  /* 输入可能是 PNG 也可能是设备端直出的 JPEG（`screencap -j`）：按头判断，别写死。 */
+  const isJpeg = png.subarray(0, 3).equals(JPEG_SIG)
   return new Promise((resolve) => {
     const child = spawn(FFMPEG, [
       '-hide_banner', '-loglevel', 'error', '-nostdin',
-      '-f', 'png_pipe', '-i', 'pipe:0',
-      '-vf', 'scale=1024:-2:flags=fast_bilinear', '-q:v', '7', '-f', 'mjpeg', 'pipe:1',
+      '-f', isJpeg ? 'mjpeg' : 'png_pipe', '-i', 'pipe:0',
+      '-vf', 'scale=1024:-2:flags=fast_bilinear', '-q:v', '8', '-f', 'mjpeg', 'pipe:1',
     ], { stdio: ['pipe', 'pipe', 'ignore'] })
     const chunks = []
     child.stdout.on('data', (chunk) => chunks.push(chunk))
@@ -172,7 +180,7 @@ export class Mirror {
     if (found !== null) this.physical = { w: Number(found[1]), h: Number(found[2]) }
     await this.snapshot()
     this.alignScreen()
-    this.timer = setInterval(() => this.pump(), 150)
+    this.timer = setInterval(() => this.pump(), 200)
     this.timer.unref?.()
     this.pushTimer = setInterval(() => this.push(), PUSH_TICK_MS)
     this.pushTimer.unref?.()
@@ -283,17 +291,32 @@ export class Mirror {
    * @returns {Promise<Buffer | null>} JPEG，抓不到时 null。
    */
   async grab() {
-    let shot
+    /* 设备端直出 JPEG 再 cat：0.36 s / 3.5 MB，比 `exec-out screencap -p`（3 s / 8.5 MB）
+       快一个量级。两件事塞进一次 exec-out，省一个 adb 往返。 */
+    let image = null
     try {
-      shot = await this.adb(['-s', this.serial, 'exec-out', 'screencap', '-p'], { timeout: 12_000 })
-    } catch {
-      return null
+      const shot = await this.adb(['-s', this.serial, 'exec-out', 'sh', '-c',
+        `screencap -j ${LIVE_SHOT} 2>/dev/null; cat ${LIVE_SHOT}`], { timeout: 6_000 })
+      const raw = shot?.raw
+      if (Buffer.isBuffer(raw) && raw.length > 2_000) {
+        const at = raw.indexOf(JPEG_SIG)
+        if (at >= 0) image = raw.subarray(at)
+      }
+    } catch { /* 老系统没有 screencap -j，走下面的 PNG 回退 */ }
+    if (image === null) {
+      let shot
+      try {
+        shot = await this.adb(['-s', this.serial, 'exec-out', 'screencap', '-p'], { timeout: 12_000 })
+      } catch {
+        return null
+      }
+      const raw = shot?.raw
+      if (!Buffer.isBuffer(raw) || raw.length < 1000) return null
+      const png = raw.indexOf(PNG_SIG)
+      if (png < 0) return null
+      image = raw.subarray(png)
     }
-    const raw = shot?.raw
-    if (!Buffer.isBuffer(raw) || raw.length < 1000) return null
-    const png = raw.indexOf(PNG_SIG)
-    if (png < 0) return null
-    const frame = await pngToJpeg(raw.subarray(png))
+    const frame = await pngToJpeg(image)
     if (frame === null) return null
     this.accept(frame)
     return frame

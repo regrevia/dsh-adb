@@ -586,7 +586,40 @@ window.__ModuleLoader__.load({
             if (typeof body.title === 'string' && body.title !== '') lastWantTitle = body.title
             const wantedTitle = String(body.title ?? lastWantTitle ?? '')
             const sameWindow = wantedTitle !== '' && String(document.title ?? '').startsWith(wantedTitle)
+            if (mounted !== want && !sameWindow && directedLogged === false) {
+              directedLogged = true
+              const names = (svc) => {
+                if (svc === undefined) return 'missing'
+                let list = []
+                let proto = Object.getPrototypeOf(svc)
+                while (proto && proto !== Object.prototype && list.length < 50) {
+                  list = list.concat(Object.getOwnPropertyNames(proto))
+                  proto = Object.getPrototypeOf(proto)
+                }
+                return [...new Set(list)]
+              }
+              report({ event: 'svc-sidebar', right: names(scope.get('sidebarRight')), tabs: names(scope.get('sidebarRightTabs')) })
+            }
             if (mounted !== want && !sameWindow) {
+              /* 不在前台也能定向开：往本会话自己的布局里建页签，不碰屏幕上的那一栏。 */
+              const directed = scope.get('sidebarRight')
+              if (typeof directed?.openTabIn === 'function') {
+                try {
+                  directed.openTabIn(want, KIND)
+                  report({ event: 'directed-open', want: String(want).slice(-8) })
+                  /* 页签先建好，再把请求挂起：等人回到这一栏，立刻展开并聚焦，不用再叫一次。 */
+                  pending = { body: JSON.stringify(body), want, until: Date.now() + 600000 }
+                  clearInterval(retry)
+                  retry = setInterval(() => {
+                    if (pending === undefined) { clearInterval(retry); return }
+                    if (Date.now() > pending.until) { pending = undefined; clearInterval(retry); return }
+                    onWanted({ data: pending.body }, true)
+                  }, 800)
+                  return
+                } catch (error) {
+                  report({ event: 'directed-fail', message: String(error?.message ?? error).slice(0, 120) })
+                }
+              }
               report({ event: 'want-skip', mounted: blank ? 'blank' : String(mounted).slice(-8), want: String(want).slice(-8), wantedTitle: String(wantedTitle).slice(0, 24), windowTitle: String(document.title ?? '').slice(0, 24) })
               /* 人还没把这一栏切到前台。请求留着：等这一栏真被切上来再开，最多等十分钟。
                  期间不碰任何别的会话那一栏，也不展开。 */
@@ -632,6 +665,7 @@ window.__ModuleLoader__.load({
           let apiLogged = false
           let pending
           let lastWantTitle = ''
+          let directedLogged = false
           let retry
           let source
           try {

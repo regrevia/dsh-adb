@@ -31,6 +31,7 @@ const clients = new Map()
 
 let wantSession = ''
 let wantAt = 0
+let wantTitle = ''
 
 /** 对外报的直播帧率：实测 4–5 帧/秒，够看清操作反馈。 */
 const LIVE_FPS = 4
@@ -463,6 +464,20 @@ export function setupMirror(ctx, tools) {
   function open(sessionId) {
     wantSession = String(sessionId ?? '')
     wantAt = Date.now()
+    wantTitle = ''
+    /* 标题只用来兜底认窗口：有些窗口是多栏的，mounted 报的是另一栏的会话。 */
+    try {
+      const listed = ctx.get?.('sessionController')?.list?.()
+      void Promise.resolve(listed).then((value) => {
+        const bare = wantSession.replace(/^session-/, '')
+        const hit = (value?.items ?? []).find((item) => {
+          const full = String(item.sessionId)
+          return full === wantSession || full.replace(/^session-/, '') === bare || full.endsWith(bare)
+        })
+        const title = hit?.projections?.values?.title
+        if (typeof title === 'string' && title !== '') wantTitle = title
+      }).catch(() => {})
+    } catch { /* 列不出来就只认 mounted */ }
     let sent = 0
     for (const res of events) {
       try {
@@ -495,6 +510,7 @@ export function setupMirror(ctx, tools) {
       const bare = session.replace(/^session-/, '')
       const known = items.find((item) => String(item.sessionId) === session)
         ?? items.find((item) => String(item.sessionId).replace(/^session-/, '') === bare)
+        ?? items.find((item) => String(item.sessionId).endsWith(bare))
       if (known !== undefined) session = String(known.sessionId)
     } catch { /* 列不出来就按原样试一次 */ }
     await mkdir(join(ROOT, 'annotations'), { recursive: true })
@@ -776,7 +792,7 @@ export function setupMirror(ctx, tools) {
       }
 
       if (path === '/want' && req.method === 'GET') {
-        return json({ session: wantSession, at: wantAt, pages: events.size })
+        return json({ session: wantSession, at: wantAt, title: wantTitle, pages: events.size })
       }
 
       if (path === '/diag' && req.method === 'POST') {

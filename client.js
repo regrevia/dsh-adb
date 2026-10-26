@@ -488,6 +488,32 @@ window.__ModuleLoader__.load({
         }
 
         ctx.inject(['sidebarRightTabs', 'sidebarRight'], (scope) => scope.effect(() => {
+        /* 诊断一次性：客户端 sessions / layout 服务里到底哪个值代表「这个窗口正显示的会话」。 */
+        try {
+          const out = {}
+          for (const service of ['sessions', 'layout', 'uiWorkspace']) {
+            const svc = scope.get(service)
+            if (svc === undefined) { out[service] = 'missing'; continue }
+            let names = []
+            let proto = Object.getPrototypeOf(svc)
+            while (proto && proto !== Object.prototype && names.length < 40) {
+              names = names.concat(Object.getOwnPropertyNames(proto))
+              proto = Object.getPrototypeOf(proto)
+            }
+            out[service] = [...new Set(names)]
+            for (const method of ['active', 'activeId', 'current', 'focused', 'selected', 'snapshot', 'getSnapshot']) {
+              try {
+                const value = typeof svc[method] === 'function' ? svc[method]() : svc[method]
+                if (value !== undefined) out[`${service}.${method}`] = String(value?.sessionId ?? value?.id ?? value?.session ?? JSON.stringify(value)).slice(0, 80)
+              } catch { /* 试不到就算 */ }
+            }
+          }
+          report({ event: 'svc', out })
+        } catch (error) {
+          report({ event: 'svc-fail', message: String(error?.message ?? error).slice(0, 120) })
+        }
+
+
           const done = []
           /* 先把页签类型注册进右栏的登记处：没有这一条，openTab 等于没调。 */
           try {
@@ -557,8 +583,11 @@ window.__ModuleLoader__.load({
                这不是许可，但也不该立刻放弃——挂上来只需要几十毫秒，等一下再看。 */
             const blank = mounted === undefined || mounted === null || mounted === ''
             /* 默认拒绝：只有「右栏正挂在发起方这一栏上」才允许占用可见栏。 */
-            if (mounted !== want) {
-              report({ event: 'want-skip', mounted: blank ? 'blank' : String(mounted).slice(-8), want: String(want).slice(-8) })
+            if (typeof body.title === 'string' && body.title !== '') lastWantTitle = body.title
+            const wantedTitle = String(body.title ?? lastWantTitle ?? '')
+            const sameWindow = wantedTitle !== '' && String(document.title ?? '').startsWith(wantedTitle)
+            if (mounted !== want && !sameWindow) {
+              report({ event: 'want-skip', mounted: blank ? 'blank' : String(mounted).slice(-8), want: String(want).slice(-8), wantedTitle: String(wantedTitle).slice(0, 24), windowTitle: String(document.title ?? '').slice(0, 24) })
               /* 人还没把这一栏切到前台。请求留着：等这一栏真被切上来再开，最多等十分钟。
                  期间不碰任何别的会话那一栏，也不展开。 */
               pending = { body: JSON.stringify(body), want, until: Date.now() + 600000 }
@@ -602,6 +631,7 @@ window.__ModuleLoader__.load({
           let wantTries = 0
           let apiLogged = false
           let pending
+          let lastWantTitle = ''
           let retry
           let source
           try {
@@ -615,8 +645,12 @@ window.__ModuleLoader__.load({
             try {
               const response = await fetch(`${ROUTE}/want`, { cache: 'no-store' }) // ui-copy-ignore
               const body = await response.json()
+              if (typeof body?.title === 'string' && body.title !== '') {
+                lastWantTitle = body.title
+                if (pending !== undefined) pending.body = JSON.stringify(body)
+              }
               if (typeof body?.session === 'string' && body.session !== '') {
-                onWanted({ data: JSON.stringify(body) })
+                onWanted({ data: JSON.stringify(body) }, pending !== undefined)
               }
             } catch { /* 宿主没起就下一跳再问 */ }
           }

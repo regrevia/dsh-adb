@@ -22,8 +22,8 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=107'
-import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=107'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=111'
+import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=111'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
 export const name = 'adb'

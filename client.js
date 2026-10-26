@@ -559,9 +559,9 @@ window.__ModuleLoader__.load({
             /* 默认拒绝：只有「右栏正挂在发起方这一栏上」才允许占用可见栏。 */
             if (mounted !== want) {
               report({ event: 'want-skip', mounted: blank ? 'blank' : String(mounted).slice(-8), want: String(want).slice(-8) })
-              /* 人还没把这一栏切到前台。请求留着：等这一栏真被切上来再开，最多等三分钟。
+              /* 人还没把这一栏切到前台。请求留着：等这一栏真被切上来再开，最多等十分钟。
                  期间不碰任何别的会话那一栏，也不展开。 */
-              pending = { body: JSON.stringify(body), want, until: Date.now() + 180000 }
+              pending = { body: JSON.stringify(body), want, until: Date.now() + 600000 }
               clearInterval(retry)
               retry = setInterval(() => {
                 if (pending === undefined) { clearInterval(retry); return }

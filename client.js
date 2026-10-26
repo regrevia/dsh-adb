@@ -467,6 +467,26 @@ window.__ModuleLoader__.load({
           }
         }
 
+        /* 诊断一次性：看清「这个窗口到底在显示哪个会话」——路由、标题、DOM 里带会话 id 的属性。 */
+        try {
+          const uuid = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+          const hits = []
+          for (const node of document.querySelectorAll('[data-session-id],[data-session],[data-id]')) {
+            hits.push(`${node.tagName.toLowerCase()}[${node.getAttribute('data-session-id') ?? node.getAttribute('data-session') ?? node.getAttribute('data-id')}]`)
+            if (hits.length > 8) break
+          }
+          const walk = []
+          for (const node of document.querySelectorAll('*')) {
+            for (const attribute of node.attributes ?? []) {
+              if (uuid.test(attribute.value)) walk.push(`${attribute.name.slice(0, 24)}=${attribute.value.slice(-36)}`)
+            }
+            if (walk.length > 10) break
+          }
+          report({ event: 'dom', href: String(location.href).slice(0, 120), title: String(document.title).slice(0, 40), hits, walk })
+        } catch (error) {
+          report({ event: 'dom-fail', message: String(error?.message ?? error).slice(0, 120) })
+        }
+
         ctx.inject(['sidebarRightTabs', 'sidebarRight'], (scope) => scope.effect(() => {
           const done = []
           /* 先把页签类型注册进右栏的登记处：没有这一条，openTab 等于没调。 */
@@ -539,13 +559,25 @@ window.__ModuleLoader__.load({
             /* 默认拒绝：只有「右栏正挂在发起方这一栏上」才允许占用可见栏。 */
             if (mounted !== want) {
               report({ event: 'want-skip', mounted: blank ? 'blank' : String(mounted).slice(-8), want: String(want).slice(-8) })
-              if (blank && wantTries < 20) {
-                wantTries += 1
-                clearTimeout(retry)
-                retry = setTimeout(() => { onWanted({ data: JSON.stringify(body) }, true) }, 250)
-              }
+              /* 人还没把这一栏切到前台。请求留着：等这一栏真被切上来再开，最多等三分钟。
+                 期间不碰任何别的会话那一栏，也不展开。 */
+              pending = { body: JSON.stringify(body), want, until: Date.now() + 180000 }
+              clearInterval(retry)
+              retry = setInterval(() => {
+                if (pending === undefined) { clearInterval(retry); return }
+                if (Date.now() > pending.until) {
+                  pending = undefined
+                  clearInterval(retry)
+                  report({ event: 'want-expire', want: String(want).slice(-8) })
+                  return
+                }
+                onWanted({ data: pending.body }, true)
+              }, 800)
+              report({ event: 'want-arm', want: String(want).slice(-8) })
               return
             }
+            pending = undefined
+            clearInterval(retry)
             const pane = right()
             if (apiLogged === false) {
               apiLogged = true
@@ -569,6 +601,7 @@ window.__ModuleLoader__.load({
           let seenWantAt = 0
           let wantTries = 0
           let apiLogged = false
+          let pending
           let retry
           let source
           try {

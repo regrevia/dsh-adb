@@ -481,13 +481,22 @@ export function setupMirror(ctx, tools) {
    * @returns {Promise<{ ok: boolean, reason?: string, bytes: number }>} 结果。
    */
   async function annotate(input) {
-    const session = String(input.session ?? '')
+    let session = String(input.session ?? '')
     const base64 = String(input.png ?? '')
     if (session === '') return { ok: false, reason: '缺少会话', bytes: 0 }
     if (base64 === '') return { ok: false, reason: '缺少画面', bytes: 0 }
     const png = Buffer.from(base64, 'base64')
     if (png.length === 0) return { ok: false, reason: '画面为空', bytes: 0 }
     if (png.length > MAX_INJECT_BYTES) return { ok: false, reason: `画面超过 ${MAX_INJECT_BYTES / 1024 / 1024}MB`, bytes: png.length }
+    /* 会话 id 可能来自工具结果的短形式，宿主认的是 session-<uuid>：按登记表补全，别让一次就对不上的 id 白丢一张标注。 */
+    const sessionController = ctx.get?.('sessionController')
+    try {
+      const items = (await sessionController.list()).items ?? []
+      const bare = session.replace(/^session-/, '')
+      const known = items.find((item) => String(item.sessionId) === session)
+        ?? items.find((item) => String(item.sessionId).replace(/^session-/, '') === bare)
+      if (known !== undefined) session = String(known.sessionId)
+    } catch { /* 列不出来就按原样试一次 */ }
     await mkdir(join(ROOT, 'annotations'), { recursive: true })
     const file = join(ROOT, 'annotations', `adb-${Date.now()}.png`)
     await writeFile(file, png)
@@ -529,6 +538,42 @@ export function setupMirror(ctx, tools) {
       return { ok: false, reason: String(error?.message ?? error).slice(0, 200), bytes: png.length }
     }
     return { ok: true, bytes: png.length, strip: strip?.length ?? 0 }
+  }
+
+  /**
+   * 一次性探针：宿主里会话控制器长什么样、认哪些 id。仅回环，调试用。
+   * @returns {Promise<any>} 控制器方法名与已注册会话 id 样本。
+   */
+  async function sessionProbe() {
+    const controller = ctx.get?.('sessionController')
+    if (controller === undefined) return { ok: false, reason: '没有 sessionController' }
+    const names = []
+    let proto = Object.getPrototypeOf(controller)
+    while (proto !== null && proto !== Object.prototype && names.length < 60) {
+      for (const name of Object.getOwnPropertyNames(proto)) if (!names.includes(name)) names.push(name)
+      proto = Object.getPrototypeOf(proto)
+    }
+    const own = Object.getOwnPropertyNames(controller).slice(0, 40)
+    try {
+      const agents = controller.agents
+      const keys = agents instanceof Map ? [...agents.keys()] : Object.keys(agents ?? {})
+      out.agentIds = keys.slice(0, 8)
+      out.agentCount = keys.length
+    } catch { /* 探不到就算了 */ }
+    const out = { ok: true, names, own }
+    for (const key of ['list', 'snapshot', 'sessions', 'get', 'states']) {
+      try {
+        const value = controller[key]
+        out[`type:${key}`] = typeof value
+        if (typeof value === 'function') {
+          const result = await value.call(controller)
+          out[`call:${key}`] = JSON.stringify(result).slice(0, 900)
+        }
+      } catch (error) {
+        out[`call:${key}`] = `ERR ${String(error?.message ?? error).slice(0, 120)}`
+      }
+    }
+    return out
   }
 
   /**
@@ -742,6 +787,9 @@ export function setupMirror(ctx, tools) {
         return json({ ok: true })
       }
 
+      if (path === '/sessions') {
+        return json(await sessionProbe())
+      }
       if (path === '/annotate' && req.method === 'POST') {
         return json(await annotate(await readJson(req)))
       }

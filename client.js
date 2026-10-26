@@ -606,7 +606,12 @@ window.__ModuleLoader__.load({
               if (typeof directed?.openTabIn === 'function') {
                 try {
                   directed.openTabIn(want, KIND)
-                  report({ event: 'directed-open', want: String(want).slice(-8) })
+                  let opened = 'unknown'
+                  try {
+                    const list = directed.tabsIn?.(want)
+                    opened = Array.isArray(list) ? list.map((tab) => String(tab?.kind ?? tab?.type ?? tab)).join(',') : String(typeof list)
+                  } catch (error) { opened = 'ERR ' + String(error?.message ?? error).slice(0, 60) }
+                  report({ event: 'directed-open', want: String(want).slice(-8), tabs: String(opened).slice(0, 120) })
                   /* 页签先建好，再把请求挂起：等人回到这一栏，立刻展开并聚焦，不用再叫一次。 */
                   pending = { body: JSON.stringify(body), want, until: Date.now() + 600000 }
                   clearInterval(retry)

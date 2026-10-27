@@ -5,3 +5,7 @@ node_modules/
 output/
 __pycache__/
 *.pyc
+annotations/
+*.mp4
+recent-*.png
+peek-*.jpg

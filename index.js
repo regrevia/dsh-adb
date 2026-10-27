@@ -22,7 +22,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=114'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=142'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=114'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -77,7 +77,24 @@ function toText(value) {
  * @returns {Promise<{ok: boolean, code: number, out: string, err: string, ms: number, timedOut: boolean}>} 结果。
  */
 function adb(args, options = {}) {
-  const { timeout = 15_000, buffer = 64 << 20 } = options
+  const { timeout = 15_000, buffer = 64 << 20, direct = false } = options
+  /* shell 走常驻通道：省掉每次 fork adb 的 40 ms 起手，工具调用密度高时差得明显。 */
+  const shellAt = args[0] === '-s' ? 2 : 0
+  if (!direct && args[shellAt] === 'shell' && args.length > shellAt + 1) {
+    const serial = args[0] === '-s' ? String(args[1]) : String(options.serial ?? '')
+    if (serial !== '') {
+      const cmd = args.slice(shellAt + 1).join(' ')
+      return sh(serial, cmd, timeout).then((result) => ({
+        ok: result.ok,
+        code: result.ok ? 0 : 1,
+        out: result.out,
+        raw: Buffer.from(result.out, 'utf8'),
+        err: result.err ?? '',
+        ms: result.ms,
+        timedOut: false,
+      }))
+    }
+  }
   const started = Date.now()
   return new Promise((resolve) => {
     execFile(ADB, args, { timeout, maxBuffer: buffer, encoding: 'buffer' }, (error, stdout, stderr) => {
@@ -379,7 +396,7 @@ async function sh(serial, cmd, timeout = 15_000) {
     const fast = await shellOnce(serial, cmd, timeout)
     if (fast.ok) return fast
     const started = performance.now()
-    const slow = await adb(['-s', serial, 'shell', cmd], { timeout })
+    const slow = await adb(['-s', serial, 'shell', cmd], { timeout, direct: true })
     return { ok: slow.ok, out: slow.out, ms: Math.round(performance.now() - started) }
   } finally {
     release()
@@ -1030,25 +1047,43 @@ async function pngSize(path) {
  */
 async function screenshot(serial, options) {
   const started = Date.now()
-  const r = await adb(['-s', serial, 'exec-out', 'screencap', '-p'], { timeout: 30_000 })
-  if (!r.ok || r.out.length === 0) throw new Error(`截图失败：${oneLine(r.err || '无输出', 160)}`)
+  /* 设备端直接编 JPEG：3.5MB / 0.6s，比 PNG 的 8.9MB 少一大截传输和 sips 解码时间。 */
+  let r = await adb(['-s', serial, 'exec-out', 'screencap', '-j'], { timeout: 30_000 })
+  let jpeg = r.ok && r.raw.length > 4 && r.raw[0] === 0xff && r.raw[1] === 0xd8
+  if (!jpeg) {
+    r = await adb(['-s', serial, 'exec-out', 'screencap', '-p'], { timeout: 30_000 }).catch(() => r)
+    jpeg = false
+  }
+  if (!r.ok || r.raw.length === 0) throw new Error(`截图失败：${oneLine(r.err || '无输出', 160)}`)
   const buffer = r.raw
   const dir = join(tmpdir(), 'dsh-adb')
   await mkdir(dir, { recursive: true })
-  const path = options.path || join(dir, `screen-${serial}-${Date.now()}.png`)
+  const path = options.path || join(dir, `screen-${serial}-${Date.now()}.${jpeg ? 'jpg' : 'png'}`)
   await writeFile(path, buffer)
   const scale = options.scale ?? 900
-  const original = await pngSize(path)
-  if (scale > 0 && Math.max(original.width, original.height) > scale) {
-    await new Promise((resolve) => execFile('sips', ['-Z', String(scale), path], () => resolve(undefined)))
+  /* 尺寸一律从磁盘上的文件头读：sips 缩过之后 buffer 已经不代表文件内容。 */
+  const dimsOf = async () => {
+    if (!jpeg) return pngSize(path).then((p) => ({ w: p.width, h: p.height }))
+    const handle = await open(path, 'r')
+    try {
+      const head = Buffer.alloc(4096)
+      const { bytesRead } = await handle.read(head, 0, head.length, 0)
+      return jpegSize(head.subarray(0, bytesRead)) ?? { w: 0, h: 0 }
+    } finally {
+      await handle.close()
+    }
   }
-  const size = await pngSize(path)
+  let size = await dimsOf()
+  if (scale > 0 && Math.max(size.w, size.h) > scale) {
+    await new Promise((resolve) => execFile('sips', ['-Z', String(scale), path], () => resolve(undefined)))
+    size = await dimsOf()
+  }
   const bytes = await stat(path).then((value) => value.size).catch(() => buffer.length)
   return {
     path,
     bytes,
-    width: size.width || original.width,
-    height: size.height || original.height,
+    width: size.w,
+    height: size.h,
     ms: Date.now() - started,
   }
 }
@@ -2137,6 +2172,49 @@ export function apply(ctx, config) {
       return { path: shot.path, bytes: shot.bytes, width: shot.width, height: shot.height, elapsed_ms: shot.ms }
     },
   }), 'adb: adb_shot')
+
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_recent',
+    description: '把最近几秒的画面拼成一张 3x2 序列图（本地环形录像里抽帧，不碰设备）：动画比例、位移、卡顿这类单帧看不出的问题用它。看路径用 read_image。',
+    parameters: {
+      type: 'object',
+      properties: {
+        seconds: { type: 'integer', description: '回看几秒，默认 6（2–12）' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          seconds: { type: 'integer' },
+          bytes: { type: 'integer' },
+          message: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['path', 'seconds', 'bytes', 'message', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      const seconds = Math.min(12, Math.max(2, Number(args.seconds ?? 6)))
+      const strip = await mirror.recentStrip(device, seconds)
+      if (strip.ok !== true) {
+        return { path: '', seconds, bytes: 0, message: '最近没有录到画面：等侧栏直播出过几帧，或先用 adb_shot 抓一张再试。', elapsed_ms: Date.now() - began }
+      }
+      return {
+        path: strip.path,
+        seconds,
+        bytes: strip.bytes,
+        message: `最近 ${seconds} 秒的 6 帧拼图：${strip.path}（${Math.round((strip.bytes ?? 0) / 1024)}KB，${Date.now() - began}ms）。看动效比例/位移用 read_image。`,
+        elapsed_ms: Date.now() - began,
+      }
+    },
+  }), 'adb: adb_recent')
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_state',

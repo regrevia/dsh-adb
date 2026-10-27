@@ -15,10 +15,12 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
+
+import { LiveStream, packFrame } from './stream.js?v=137'
 
 /** 客户端与宿主共用的路由前缀。 */
 export const ROUTE = '/dsh-adb'
@@ -34,7 +36,7 @@ let wantAt = 0
 let wantTitle = ''
 
 /** 对外报的直播帧率：实测 4–5 帧/秒，够看清操作反馈。 */
-const LIVE_FPS = 4
+const LIVE_FPS = 3
 /** 往外送帧的节奏：并发截图是一股一股完成的，按固定节拍取最新一帧才顺。 */
 const PUSH_TICK_MS = 200
 /** 同时在飞的截图数：单张约 0.65s，3 张并发实测 4 帧/秒以上。 */
@@ -48,15 +50,21 @@ const SEGMENT_KEEP = 18
 const MAX_INJECT_BYTES = 8 * 1024 * 1024
 
 /** 找 ffmpeg：DSH 进程的 PATH 未必带 Homebrew。 */
-function pickFfmpeg() {
-  if (process.env.FFMPEG) return process.env.FFMPEG
-  for (const candidate of ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg']) {
+function pickFfmpeg(name = 'ffmpeg') {
+  const env = name === 'ffmpeg' ? process.env.FFMPEG : process.env.FFPROBE
+  if (env) return env
+  for (const dir of ['/opt/homebrew/bin', '/usr/local/bin']) {
+    const candidate = `${dir}/${name}`
     if (existsSync(candidate)) return candidate
   }
-  return 'ffmpeg'
+  return name
 }
 
+/** 开发探针（/dev/mse、/sessions）只在明确打开时挂上，发布版不暴露。 */
+const DEV = process.env.DSH_ADB_DEV === '1'
+
 const FFMPEG = pickFfmpeg()
+const FFPROBE = pickFfmpeg('ffprobe')
 
 /** 环形缓冲落盘位置：本机私有目录，不随工作区进版本库。 */
 const ROOT = join(homedir(), '.dsh', 'adb-mirror')
@@ -92,6 +100,16 @@ const JPEG_SIG = Buffer.from([0xff, 0xd8, 0xff])
 
 /** 设备端截图落点：同一台设备只留一份，覆盖写。 */
 const LIVE_SHOT = '/data/local/tmp/.dsh-adb-live.jpg'
+
+/* 页面代码的版本号：写在 client.rev 里。页面拿 /state 的 build 和自己带的对一下，
+   不一致就自己重载，省掉「改一次客户端就要人按一次刷新」。 */
+const CLIENT_BUILD = (() => {
+  try {
+    return String(readFileSync(new URL('./client.rev', import.meta.url), 'utf8')).trim()
+  } catch {
+    return ''
+  }
+})()
 
 /**
  * 一张 PNG 转成 JPEG：/live 走 MJPEG，帧只能是 JPEG。
@@ -150,6 +168,11 @@ export class Mirror {
     this.width = 0
     this.height = 0
     this.watchers = new Set()
+    this.lastWatchAt = 0
+    this.dropped = 0
+    this.seq = 0
+    this.waiters = []
+    this.grabMs = 0
     this.recording = false
     this.stopping = false
     this.startedAt = 0
@@ -171,6 +194,14 @@ export class Mirror {
   }
 
   /** 起抓帧泵与分段录制；重复调用无副作用。 @returns {Promise<void>} 起好了。 */
+  /**
+   * 有没有人在看：常连的 MJPEG 观看者，或 6 秒内来拉过单帧的面板。
+   * @returns {boolean} 有观看者（或刚有人来看）为真。
+   */
+  anyoneWatching() {
+    return this.watchers.size > 0 || Date.now() - this.lastWatchAt < 6000
+  }
+
   async start() {
     if (this.timer !== null || this.stopping) return
     await mkdir(this.dir, { recursive: true })
@@ -206,7 +237,7 @@ export class Mirror {
   /** 有人在看才抓帧；没人看就空转并顺手关掉转码进程。 @returns {void} */
   pump() {
     if (this.stopping) return
-    if (this.watchers.size === 0) {
+    if (!this.anyoneWatching()) {
       if (this.inflight === 0) {
         if (this.idleSince === 0) this.idleSince = Date.now()
       }
@@ -237,6 +268,36 @@ export class Mirror {
     if (this.seen.length > 40) this.seen.shift()
     this.recent.push({ at, jpeg: frame })
     if (this.recent.length > 40) this.recent.shift()
+    this.seq += 1
+    if (this.waiters.length > 0) {
+      const pending = this.waiters
+      this.waiters = []
+      for (const wake of pending) wake()
+    }
+  }
+
+  /**
+   * 等到比 `since` 更新的一帧：画面一动就回，最多等 `ms`。
+   * 客户端拿它做长轮询，省掉固定间隔的空转，延迟只剩「抓一帧」的时间。
+   * @param {number} since - 客户端已有的帧序号。
+   * @param {number} ms - 最长等待毫秒。
+   * @returns {Promise<Buffer | null>} JPEG，没等到时 null。
+   */
+  nextFrame(since, ms) {
+    if (this.seq > since && this.latest !== null) return Promise.resolve(this.latest)
+    return new Promise((resolve) => {
+      let done = false
+      const finish = (frame) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        this.waiters = this.waiters.filter((each) => each !== wake)
+        resolve(frame)
+      }
+      const wake = () => finish(this.latest)
+      const timer = setTimeout(() => finish(null), ms)
+      this.waiters.push(wake)
+    })
   }
 
   /**
@@ -246,7 +307,7 @@ export class Mirror {
    * @returns {Promise<Buffer | null>} PNG；不够帧时 null。
    */
   async recentStrip(seconds = 6) {
-    if (this.recent.length < 3) return null
+    if (this.recent.length < 3) return this.recentStripFromDisk(seconds)
     const newest = this.recent[this.recent.length - 1].at
     const picks = []
     for (let index = 5; index >= 0; index -= 1) {
@@ -274,6 +335,60 @@ export class Mirror {
   }
 
   /**
+   * 没人看直播时内存里没有帧，但本地环形录像一直在跑：直接从最近一段录像里抽帧拼图。
+   * 「刚才我点了两下，桌宠变大不对劲」这种事后回看走这条路。
+   * @param {number} seconds - 回看多少秒。
+   * @returns {Promise<Buffer | null>} PNG 拼图；抽不到时 null。
+   */
+  async recentStripFromDisk(seconds = 6) {
+    const list = await this.segments()
+    if (list.length === 0) return null
+    for (const item of list.slice(-2).reverse()) {
+      const file = join(this.dir, item.segment)
+      /* 段是 10s 的 screenrecord 产物：末尾那段可能还在写，先问时长再定窗口。 */
+      const duration = await new Promise((resolve) => {
+        const child = spawn(FFPROBE, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file])
+        let out = ""
+        child.stdout.on("data", (chunk) => { out += chunk })
+        child.on("error", () => resolve(0))
+        child.on("close", () => resolve(Number(out.trim()) || 0))
+      })
+      if (!(duration > 0.6)) continue
+      const window = Math.min(seconds, duration)
+      const step = window / 6
+      const picks = []
+      for (let index = 0; index < 6; index += 1) {
+        const at = Math.max(0, duration - window + (index * step))
+        const jpeg = await new Promise((resolve) => {
+          const child = spawn(FFMPEG, ["-v", "error", "-ss", at.toFixed(3), "-i", file, "-frames:v", "1",
+            "-vf", "scale=-2:300", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"])
+          const chunks = []
+          child.stdout.on("data", (chunk) => chunks.push(chunk))
+          child.on("error", () => resolve(null))
+          child.on("close", () => resolve(chunks.length > 0 ? Buffer.concat(chunks) : null))
+        })
+        if (jpeg === null) break
+        picks.push(jpeg)
+      }
+      if (picks.length < 3) continue
+      while (picks.length < 6) picks.push(picks[picks.length - 1])
+      const strip = await new Promise((resolve) => {
+        const child = spawn(FFMPEG, ["-v", "error", "-f", "image2pipe", "-framerate", "1", "-c:v", "mjpeg", "-i", "pipe:0",
+          "-vf", "scale=-2:300,tile=3x2:padding=6:color=0x222222", "-frames:v", "1", "-c:v", "png", "-f", "image2pipe", "pipe:1"])
+        const chunks = []
+        let settled = false
+        child.stdout.on("data", (chunk) => chunks.push(chunk))
+        child.on("error", () => { if (!settled) { settled = true; resolve(null) } })
+        child.on("close", () => { if (!settled) { settled = true; resolve(chunks.length > 0 ? Buffer.concat(chunks) : null) } })
+        for (const jpeg of picks.slice(0, 6)) child.stdin.write(jpeg)
+        child.stdin.end()
+      })
+      if (strip !== null) return strip
+    }
+    return null
+  }
+
+  /**
    * 抓一张当前画面当最新帧：屏幕静止时编码器不出帧，靠它兜底。
    * @returns {Promise<Buffer | null>} JPEG，抓不到时 null。
    */
@@ -292,16 +407,34 @@ export class Mirror {
    * @returns {Promise<Buffer | null>} JPEG，抓不到时 null。
    */
   async grab() {
+    const began = Date.now()
+    const frame0 = await this.grabOnce()
+    this.grabMs = Date.now() - began
+    return frame0
+  }
+
+  /**
+   * 抓一张原始实现，`grab` 只在外层记耗时。
+   * @returns {Promise<Buffer | null>} JPEG。
+   */
+  async grabOnce() {
     /* 设备端直出 JPEG 再 cat：0.36 s / 3.5 MB，比 `exec-out screencap -p`（3 s / 8.5 MB）
        快一个量级。两件事塞进一次 exec-out，省一个 adb 往返。 */
     let image = null
     try {
+      /* JPEG 直接写 stdout：不再落临时文件，也就没有两张并发抢同一个文件、cat 到半截
+         图像（画面突然一大块颜色就是这么来的）。一次 adb 往返，3.5 MB。 */
       const shot = await this.adb(['-s', this.serial, 'exec-out', 'sh', '-c',
-        `screencap -j ${LIVE_SHOT} 2>/dev/null; cat ${LIVE_SHOT}`], { timeout: 6_000 })
+        'screencap -j /dev/stdout 2>/dev/null'], { timeout: 6_000 })
       const raw = shot?.raw
       if (Buffer.isBuffer(raw) && raw.length > 2_000) {
         const at = raw.indexOf(JPEG_SIG)
-        if (at >= 0) image = raw.subarray(at)
+        if (at >= 0) {
+          const jpeg = raw.subarray(at)
+          /* 只收完整帧：结尾缺 EOI 就是被截断的图，画上去就是色块。 */
+          if (jpeg.length > 2_000 && jpeg.subarray(-2).equals(Buffer.from([0xff, 0xd9]))) image = jpeg
+          else this.dropped += 1
+        }
       }
     } catch { /* 老系统没有 screencap -j，走下面的 PNG 回退 */ }
     if (image === null) {
@@ -336,7 +469,7 @@ export class Mirror {
       const recorded = await this.adb([
         '-s', this.serial, 'shell', 'screenrecord',
         '--time-limit', String(SEGMENT_SECONDS),
-        '--bit-rate', '4000000', '--size', '720x1280', remote,
+        '--bit-rate', '2000000', '--size', '960x640', remote,
       ], { timeout: (SEGMENT_SECONDS + 20) * 1000 })
       if (this.stopping) break
       if (!recorded.ok) {
@@ -386,7 +519,7 @@ export class Mirror {
    * @returns {void}
    */
   push() {
-    if (this.watchers.size === 0 || this.latest === null) return
+    if (!this.anyoneWatching() || this.latest === null) return
     this.sentAt = this.latestAt
     this.pushed += 1
     const frame = this.latest
@@ -445,12 +578,28 @@ export class Mirror {
 export function setupMirror(ctx, tools) {
   const mirrors = new Map()
   const events = new Set()
+  /** 每台设备的 H.264 推流。 @type {Map<string, LiveStream>} */
+  const streams = new Map()
 
   /**
    * 拿一台设备的镜像，没有就建。
    * @param {string} serial - 序列号。
    * @returns {Mirror} 镜像。
    */
+  /**
+   * 拿一台设备的持续推流，没有就建。和抓帧的 Mirror 并行，互不影响。
+   * @param {string} serial - 序列号。
+   * @returns {LiveStream} 推流。
+   */
+  function streamFor(serial) {
+    let stream = streams.get(serial)
+    if (stream === undefined) {
+      stream = new LiveStream({ serial, adb: tools.adb.path })
+      streams.set(serial, stream)
+    }
+    return stream
+  }
+
   function mirrorFor(serial) {
     let mirror = mirrors.get(serial)
     if (mirror === undefined) {
@@ -498,10 +647,11 @@ export function setupMirror(ctx, tools) {
   async function annotate(input) {
     let session = String(input.session ?? '')
     const base64 = String(input.png ?? '')
+    const wantsRecent = input.recent === true
     if (session === '') return { ok: false, reason: '缺少会话', bytes: 0 }
-    if (base64 === '') return { ok: false, reason: '缺少画面', bytes: 0 }
-    const png = Buffer.from(base64, 'base64')
-    if (png.length === 0) return { ok: false, reason: '画面为空', bytes: 0 }
+    if (base64 === '' && !wantsRecent) return { ok: false, reason: '缺少画面', bytes: 0 }
+    const png = base64 === '' ? Buffer.alloc(0) : Buffer.from(base64, 'base64')
+    if (png.length === 0 && !wantsRecent) return { ok: false, reason: '画面为空', bytes: 0 }
     if (png.length > MAX_INJECT_BYTES) return { ok: false, reason: `画面超过 ${MAX_INJECT_BYTES / 1024 / 1024}MB`, bytes: png.length }
     /* 会话 id 可能来自工具结果的短形式，宿主认的是 session-<uuid>：按登记表补全，别让一次就对不上的 id 白丢一张标注。 */
     const sessionController = ctx.get?.('sessionController')
@@ -513,9 +663,6 @@ export function setupMirror(ctx, tools) {
         ?? items.find((item) => String(item.sessionId).endsWith(bare))
       if (known !== undefined) session = String(known.sessionId)
     } catch { /* 列不出来就按原样试一次 */ }
-    await mkdir(join(ROOT, 'annotations'), { recursive: true })
-    const file = join(ROOT, 'annotations', `adb-${Date.now()}.png`)
-    await writeFile(file, png)
     const controller = ctx.get?.('sessionController')
     const writable = controller?.prompt !== undefined
     const rect = input.rect ?? null
@@ -537,11 +684,9 @@ export function setupMirror(ctx, tools) {
       lines.push(`最近 6 秒的画面（每张间隔约 1 秒，左上→右下，看动效比例/位移是否连贯）：`)
     }
     if (!writable) return { ok: false, reason: '会话不在可写入状态', bytes: png.length, strip: strip?.length ?? 0 }
-    if (lines.length === 0) lines.push('标注了一张设备画面。')
-    const content = [
-      { type: 'text', text: lines.join('\n') },
-      { type: 'image', mediaType: 'image/png', data: png.toString('base64'), name: 'device-annotated.png' },
-    ]
+    if (lines.length === 0) lines.push(wantsRecent ? '请看一下最近几秒的画面。' : '标注了一张设备画面。')
+    const content = [{ type: 'text', text: lines.join('\n') }]
+    if (png.length > 0) content.push({ type: 'image', mediaType: 'image/png', data: png.toString('base64'), name: 'device-annotated.png' })
     if (strip !== null) content.push({ type: 'image', mediaType: 'image/png', data: strip.toString('base64'), name: 'device-recent-frames.png' })
     try {
       await controller.prompt({
@@ -552,6 +697,11 @@ export function setupMirror(ctx, tools) {
       }, new AbortController().signal)
     } catch (error) {
       return { ok: false, reason: String(error?.message ?? error).slice(0, 200), bytes: png.length }
+    }
+    if (png.length > 0) {
+      /* 发成功才落盘：失败时不留一堆没人看过的标注图。 */
+      await mkdir(join(ROOT, 'annotations'), { recursive: true }).catch(() => {})
+      await writeFile(join(ROOT, 'annotations', `adb-${Date.now()}.png`), png).catch(() => {})
     }
     return { ok: true, bytes: png.length, strip: strip?.length ?? 0 }
   }
@@ -723,16 +873,79 @@ export function setupMirror(ctx, tools) {
         return
       }
 
+      if (path === '/stream' && req.method === 'GET') {
+        const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        const stream = streamFor(serial)
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'cache-control': 'no-store, no-transform',
+          'x-accel-buffering': 'no',
+          connection: 'keep-alive',
+        })
+        res.flushHeaders()
+        let closed = false
+        const unsubscribe = stream.subscribe((bytes) => {
+          if (closed) return
+          /* 积压超过 2 MB 就断开重连：宁可重连一次，也不要让延迟越滚越大。 */
+          if (res.writableLength > 2 << 20) {
+            closed = true
+            unsubscribe()
+            res.destroy()
+            return
+          }
+          res.write(bytes)
+        })
+        const close = () => {
+          if (closed) return
+          closed = true
+          unsubscribe()
+        }
+        req.on('close', close)
+        res.on('close', close)
+        res.on('error', close)
+        return
+      }
+
+      if (path === '/stream/info' && req.method === 'GET') {
+        const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        return json(streamFor(serial).info())
+      }
+
+      if (path === '/dev/mse' && req.method === 'GET' && DEV === true) {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+        res.end(DEV_MSE_PAGE)
+        return
+      }
+      if (path === '/watching') {
+        const serial = url.searchParams.get('serial') || await tools.resolveSerial()
+        const mirror = mirrorFor(serial)
+        mirror.lastWatchAt = Date.now()
+        void mirror.start()
+        return json({ watching: true })
+      }
+
       if (path === '/frame' && req.method === 'GET') {
         const serial = url.searchParams.get('serial') || await tools.resolveSerial()
         const mirror = mirrorFor(serial)
+        mirror.lastWatchAt = Date.now()
         void mirror.start()
-        let frame = await mirror.firstFrame(4000)
-        if (frame !== null && Date.now() - mirror.latestAt > 1200) {
-          frame = (await mirror.snapshot()) ?? frame
+        const since = Number(url.searchParams.get('since') ?? '') || 0
+        const wait = Math.min(2500, Math.max(0, Number(url.searchParams.get('wait') ?? '') || 0))
+        let frame = null
+        if (wait > 0) {
+          if (mirror.seq === 0) frame = await mirror.firstFrame(4000)
+          if (frame === null) frame = await mirror.nextFrame(since, wait)
+        } else {
+          frame = await mirror.firstFrame(4000)
+          if (frame !== null && Date.now() - mirror.latestAt > 1200) frame = (await mirror.snapshot()) ?? frame
         }
         if (frame === null) return json({ error: '画面还没起来' }, 503)
-        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' })
+        res.writeHead(200, {
+          'content-type': 'image/jpeg',
+          'cache-control': 'no-store',
+          'x-adb-seq': String(mirror.seq),
+          'x-adb-at': String(mirror.latestAt),
+        })
         return res.end(frame)
       }
 
@@ -743,11 +956,15 @@ export function setupMirror(ctx, tools) {
         const segments = await mirror.segments()
         return json({
           serial,
+          build: CLIENT_BUILD,
+          stream: (streams.get(serial) ?? null)?.info() ?? null,
           started: mirror.startedAt,
           frames: mirror.frames,
           fps: mirror.measuredFps(),
           live: mirror.latest !== null,
           watchers: mirror.watchers.size,
+          dropped: mirror.dropped,
+          grabMs: mirror.grabMs,
           pushed: mirror.pushed,
           screen: mirror.screen,
           frame: mirror.latest === null ? null : { w: mirror.frameSize.w, h: mirror.frameSize.h },
@@ -773,7 +990,26 @@ export function setupMirror(ctx, tools) {
 
       if (path === '/tap' && req.method === 'POST') {
         const body = await readJson(req)
-        return json(await input(String(body.serial ?? ''), ['tap', String(Math.round(body.x)), String(Math.round(body.y))]))
+        const x = String(Math.round(body.x))
+        const y = String(Math.round(body.y))
+        /* 长按用同点 swipe 顶住 700 ms：input 没有 longpress 子命令。 */
+        const args = body.long === true ? ['swipe', x, y, x, y, '700'] : ['tap', x, y]
+        return json(await input(String(body.serial ?? ''), args))
+      }
+
+      if (path === '/scroll' && req.method === 'POST') {
+        const body = await readJson(req)
+        const serial = String(body.serial ?? '')
+        const x = Math.round(Number(body.x ?? 0))
+        const y = Math.round(Number(body.y ?? 0))
+        const dy = Math.max(-4000, Math.min(4000, Number(body.dy ?? 0)))
+        if (serial === '' || dy === 0) return json({ ok: false, reason: '缺少参数' })
+        /* 滚轮向下 = 内容上移，手指就从下往上滑。 */
+        const span = Math.max(60, Math.min(900, Math.abs(dy)))
+        const from = dy > 0 ? y + span / 2 : y - span / 2
+        const to = dy > 0 ? y - span / 2 : y + span / 2
+        const ms = String(Math.max(120, Math.min(320, Math.round(span * 0.5))))
+        return json(await input(serial, ['swipe', String(x), String(Math.round(from)), String(x), String(Math.round(to)), ms]))
       }
 
       if (path === '/swipe' && req.method === 'POST') {
@@ -784,6 +1020,17 @@ export function setupMirror(ctx, tools) {
           String(Math.round(body.x2)), String(Math.round(body.y2)),
           String(Math.round(body.ms ?? 300)),
         ]))
+      }
+
+      if (path === '/text' && req.method === 'POST') {
+        const body = await readJson(req)
+        const serial = String(body.serial ?? '')
+        const text = String(body.text ?? '').slice(0, 400)
+        if (serial === '' || text === '') return json({ ok: false, reason: '缺少参数' })
+        if (/[^\x20-\x7e]/.test(text)) return json({ ok: false, reason: 'adb input 只吃 ASCII：中文请在设备上输入，或复制粘贴' })
+        /* adb input 的坑：空格要写成 %s，其余空格类字符一律换掉，否则整句被截断。 */
+        const escaped = text.replace(/\\/g, '\\\\').replace(/ /g, '%s').replace(/\s+/g, '%s').replace(/['"]/g, '')
+        return json(await input(serial, ['text', escaped]))
       }
 
       if (path === '/key' && req.method === 'POST') {
@@ -803,7 +1050,7 @@ export function setupMirror(ctx, tools) {
         return json({ ok: true })
       }
 
-      if (path === '/sessions') {
+      if (path === '/sessions' && DEV === true) {
         return json(await sessionProbe())
       }
       if (path === '/annotate' && req.method === 'POST') {
@@ -855,6 +1102,21 @@ export function setupMirror(ctx, tools) {
       if (Date.now() - mirror.latestAt > 2500) return null
       return { frame: mirror.latest, at: mirror.latestAt }
     },
+    /**
+     * 最近几秒的画面拼成一张 3x2 图：动效比例/位移这类问题看序列帧最快。
+     * @param {string} serial - 设备。
+     * @param {number} seconds - 回看秒数。
+     * @returns {Promise<{ ok: boolean, path?: string, bytes?: number }>} 结果。
+     */
+    async recentStrip(serial, seconds = 6) {
+      const mirror = mirrorFor(serial)
+      const strip = await mirror.recentStrip(seconds)
+      if (strip === null) return { ok: false }
+      const file = join(ROOT, `recent-${serial.replace(/[^\w.-]/g, "_")}-${Date.now()}.png`)
+      await mkdir(dirname(file), { recursive: true })
+      await writeFile(file, strip)
+      return { ok: true, path: file, bytes: strip.length }
+    },
     async status(serial) {
       const chosen = serial ?? await tools.resolveSerial().catch(() => '')
       const mirror = mirrors.get(chosen)
@@ -890,3 +1152,69 @@ export const MIRROR_ROOT = ROOT
 
 /** 段长，工具层汇报用。 */
 export const SEGMENT = { seconds: SEGMENT_SECONDS, keep: SEGMENT_KEEP, fps: LIVE_FPS }
+
+/**
+ * 【内部自测页】只在开发时用来验证 MSE 链路：打开 /dsh-adb/dev/mse 就能自己订阅 /stream。
+ * 产品界面走 client.js，这个页面不参与打包。
+ */
+const DEV_MSE_PAGE = `<!doctype html><meta charset="utf-8"><title>MSE probe</title>
+<body style="margin:0;background:#111;color:#ddf;font:13px ui-monospace">
+<video id="v" muted playsinline autoplay style="width:960px;height:640px;background:#000"></video>
+<pre id="s">booting</pre>
+<script>
+const v = document.getElementById('v'), S = document.getElementById('s')
+const q = new URLSearchParams(location.search)
+const serial = q.get('serial') || ''
+const t0 = performance.now()
+let sb = null, queue = [], inits = 0, media = 0, shown = 0, first = 0, err = ''
+function say() {
+  const b = sb && sb.buffered.length > 0 ? sb.buffered.end(sb.buffered.length - 1) : 0
+  S.textContent = ['ready', v.readyState, 't', v.currentTime.toFixed(2), 'buf', b.toFixed(2),
+    'err', v.error ? v.error.code : 0,
+    'init', inits, 'media', media, 'res', v.videoWidth + 'x' + v.videoHeight,
+    'first', first ? Math.round(first) + 'ms' : '-', err].join(' ')
+}
+function reset() {
+  sb = null; queue = []
+  const ms = new MediaSource()
+  ms.addEventListener('sourceopen', () => {
+    sb = ms.addSourceBuffer('video/mp4; codecs="avc1.640020"')
+    sb.mode = 'segments'
+    sb.addEventListener('updateend', () => {
+      if (queue.length > 0) push()
+      else if (v.paused && sb.buffered.length > 0) v.play().catch(() => {})
+    })
+    push()
+  }, { once: true })
+  v.src = URL.createObjectURL(ms)
+  v.play().catch(() => {})
+}
+function push() {
+  if (sb === null || sb.updating || queue.length === 0) return
+  try { sb.appendBuffer(queue.shift()) } catch (e) { err = 'append: ' + e.message }
+}
+v.addEventListener('loadeddata', () => { if (!shown) { shown = 1; first = performance.now() - t0 } })
+async function run() {
+  const res = await fetch('/dsh-adb/stream?serial=' + encodeURIComponent(serial))
+  const rd = res.body.getReader()
+  let buf = new Uint8Array(0)
+  for (;;) {
+    const { value, done } = await rd.read()
+    if (done) break
+    const merged = new Uint8Array(buf.length + value.length)
+    merged.set(buf); merged.set(value, buf.length); buf = merged
+    for (;;) {
+      if (buf.length < 5) break
+      const len = new DataView(buf.buffer, buf.byteOffset).getUint32(1, false)
+      if (buf.length < 5 + len) break
+      const type = buf[0], body = buf.slice(5, 5 + len)
+      buf = buf.slice(5 + len)
+      if (type === 1) { inits += 1; reset(); queue.push(body) }
+      else if (type === 2) { media += 1; queue.push(body); push() }
+    }
+  }
+}
+setInterval(() => { say(); if (v.paused && v.readyState > 0) v.play().catch(() => {}) }, 400)
+reset()
+run().catch((e) => { err = e.message })
+</script>`

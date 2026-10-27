@@ -1,6 +1,6 @@
 {
   "name": "dsh-adb",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": false,
   "description": "真机调试插件：界面文本树、动效数据、实时画面侧栏与圈选标注",
   "type": "module",
@@ -28,22 +28,28 @@
     "index.js",
     "mirror.js",
     "client.js",
+    "client.rev",
+    "stream.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
     "vendor",
     "README.md",
-    "selftest.mjs"
+    "selftest.mjs",
+    "ocr.js",
+    "ocr_worker.py",
+    "THIRD_PARTY_NOTICES.md",
+    "docs/opensource-audit.md"
   ],
   "license": "MIT",
   "author": "dsh-adb contributors",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-name/dsh-adb"
+    "url": "https://github.com/regrevia/dsh-adb"
   },
-  "homepage": "https://github.com/your-name/dsh-adb#readme",
+  "homepage": "https://github.com/regrevia/dsh-adb#readme",
   "bugs": {
-    "url": "https://github.com/your-name/dsh-adb/issues"
+    "url": "https://github.com/regrevia/dsh-adb/issues"
   },
   "keywords": [
     "dsh",

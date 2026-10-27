@@ -108,6 +108,52 @@ console.log('\n[12] adb_do 两步（等桌面文字 + 回桌面）')
 const batch = await call('adb_do', { steps: [{ action: 'home' }, { sleep_ms: 200 }], timeout_ms: 5000 })
 ok('两步一次跑完', `${batch.value.steps} 步 / ${batch.ms}ms`)
 
+console.log('\n[13] 推流接口（/stream/info + /stream 3 秒）')
+/* 宿主端口会变：从环境变量取，默认当前的 GUI 端口。 */
+const base = process.env.DSH_ADB_BASE ?? 'http://127.0.0.1:50802/dsh-adb'
+const info = await fetch(`${base}/stream/info?serial=${encodeURIComponent(device.value.serial)}`).then((res) => res.json()).catch(() => null)
+if (info === null) bad('拿不到 /stream/info')
+else ok('/stream/info 可读', `codec=${info.codec || '(未开)'} clients=${info.clients}`)
+try {
+  const control = new AbortController()
+  const timer = setTimeout(() => control.abort(), 3000)
+  const res = await fetch(`${base}/stream?serial=${encodeURIComponent(device.value.serial)}`, { signal: control.signal })
+  const reader = res.body.getReader()
+  let bytes = 0
+  let init = 0
+  let media = 0
+  let pending = Buffer.alloc(0)
+  for (;;) {
+    const { done, value } = await reader.read().catch(() => ({ done: true, value: null }))
+    if (done || value === null) break
+    pending = Buffer.concat([pending, Buffer.from(value)])
+    while (pending.length >= 5) {
+      const size = pending.readUInt32BE(1)
+      if (pending.length < 5 + size) break
+      const type = pending[0]
+      if (type === 1) init += 1
+      if (type === 2) media += 1
+      bytes += 5 + size
+      pending = pending.subarray(5 + size)
+    }
+  }
+  clearTimeout(timer)
+  /* 静态画面时 screenrecord 约 1 帧/秒，3 秒窗口可能一片都没有：初始化段到了就算链路通。 */
+  if (init > 0) ok('推流链路可订阅', `init ${init} / media ${media} / ${Math.round(bytes / 1024)}KB`)
+  else bad('推流没出片', `init ${init} / media ${media}`)
+} catch (error) {
+  bad('推流读取失败', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[14] 镜像输入接口参数校验（不发真实手势）')
+const scrollBad = await fetch(`${base}/scroll`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ serial: device.value.serial, x: 10, y: 10, dy: 0 }),
+}).then((res) => res.json()).catch(() => null)
+if (scrollBad?.ok === false) ok('/scroll 空位移被拒', scrollBad.reason)
+else bad('/scroll 参数校验不对', JSON.stringify(scrollBad))
+
 if (wantTap) {
   console.log('\n[13] adb_tap 真点（--tap）')
   const target = treeText.split('\n').find((line) => line.includes(' *'))
@@ -117,6 +163,28 @@ if (wantTap) {
     const tap = await call('adb_tap', { ref })
     ok('按 ref 点击', tap.value.message)
   }
+}
+
+console.log('\n[15] adb_recent 近几秒拼图')
+try {
+  const recent = await call('adb_recent', { seconds: 6 })
+  if (recent.value.bytes > 20000) {
+    ok('抽到 6 帧拼图', `${recent.value.bytes} bytes / ${recent.value.elapsed_ms}ms`)
+  } else {
+    bad('没抽到拼图', JSON.stringify(recent.value).slice(0, 120))
+  }
+} catch (error) {
+  bad('adb_recent 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[16] adb_shot 缩放与尺寸')
+try {
+  const shot = await call('adb_shot', { scale: 600 })
+  const fits = shot.value.width <= 600 && shot.value.height <= 600 && shot.value.width > 300
+  if (fits) ok('尺寸按缩放回报', `${shot.value.width}x${shot.value.height} / ${shot.value.elapsed_ms}ms`)
+  else bad('尺寸回报不对', `${shot.value.width}x${shot.value.height}`)
+} catch (error) {
+  bad('adb_shot 抛错', String(error?.message ?? error).slice(0, 80))
 }
 
 console.log('\n=== 完成 ===\n')

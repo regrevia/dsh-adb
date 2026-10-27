@@ -9,6 +9,9 @@
  * 画面、录制、标注落盘都在宿主那半边，这里只负责画出来和收集人的动作。
  */
 
+/* 页面代码的版本号：宿主报的和这里不一致，说明页面还在跑旧模块，自己重载一次。 */
+window.__ADBM_BUILD = '142'
+
 window.__ModuleLoader__.load({
   id: 'dsh-adb',
   factory(require) {
@@ -30,6 +33,7 @@ window.__ModuleLoader__.load({
         'act.tap': '点按',
         'act.send': '发送',
         'act.clear': '清除',
+        'act.recent': '近几秒',
         'state.starting': '画面准备中',
         'state.sent': '已发送',
         'state.failed': '发送失败',
@@ -42,6 +46,7 @@ window.__ModuleLoader__.load({
         'act.tap': 'Tap',
         'act.send': 'Send',
         'act.clear': 'Clear',
+        'act.recent': 'Last seconds',
         'state.starting': 'Starting',
         'state.sent': 'Sent',
         'state.failed': 'Send failed',
@@ -75,6 +80,7 @@ window.__ModuleLoader__.load({
       '.adbm-stage{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden}',
       '.adbm-frame{position:relative;display:inline-flex;max-width:100%;max-height:100%;line-height:0}',
       '.adbm-img{display:block;max-width:100%;max-height:100%;background:#000;border-radius:6px;-webkit-user-drag:none;user-select:none}',
+      '.adbm-video{display:block;max-width:100%;max-height:100%;background:#000;border-radius:6px;object-fit:contain}',
       '.adbm-ink{position:absolute;inset:0;touch-action:none}',
       '.adbm-ink[data-mode="mark"]{cursor:crosshair}',
       '.adbm-ink[data-mode="tap"]{cursor:pointer}',
@@ -101,23 +107,200 @@ window.__ModuleLoader__.load({
      * @param {{ sessionId: string }} props - 这一栏属于哪个会话。
      * @returns {any} 元素。
      */
+    /* 播放器封包格式必须和服务端 stream.js 一致：[类型 1 B][长度 4 B BE][负载]。 */
+    const STREAM_META = 0 // ui-copy-ignore
+    const STREAM_INIT = 1 // ui-copy-ignore
+    const STREAM_MEDIA = 2 // ui-copy-ignore
+    const STREAM_END = 3 // ui-copy-ignore
+
+    /* 持续推流播放：MediaSource 收分片 MP4，收到哪帧放哪帧，静止时零流量。
+       任何一步不成就回调 onFail，上层继续用抓帧那条路，画面不会断。 */
+    function startLiveVideo(options) {
+      const serial = String(options.serial ?? '')
+      const video = options.video
+      let stopped = false
+      let mediaSource = null
+      let sourceBuffer = null
+      let objectUrl = ''
+      let queue = []
+      let appending = false
+      let codec = ''
+      let controller = new AbortController()
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+      const meta = (payload) => {
+        try { return JSON.parse(new TextDecoder().decode(payload)) } catch { return null }
+      }
+      let initPayload = null
+      const reset = () => {
+        queue = []
+        appending = false
+        sourceBuffer = null
+        mediaSource = null
+        if (objectUrl !== '') {
+          URL.revokeObjectURL(objectUrl)
+          objectUrl = ''
+        }
+        try { video.removeAttribute('src'); video.load() } catch { /* 无所谓 */ }
+      }
+      /* 一份 moov 对应一个 MediaSource：换 init 必须整条重来，不能往旧的分片流里塞。 */
+      const ensureSource = () => {
+        if (mediaSource !== null || codec === '' || typeof window.MediaSource !== 'function') return
+        try {
+          mediaSource = new window.MediaSource()
+        } catch {
+          options.onFail?.('mediasource')
+          return
+        }
+        objectUrl = URL.createObjectURL(mediaSource)
+        video.src = objectUrl
+        video.muted = true
+        mediaSource.addEventListener('sourceopen', () => {
+          attach()
+          if (initPayload !== null && queue.length === 0) queue = [initPayload]
+          appendNext()
+        })
+      }
+      const appendNext = () => {
+        if (sourceBuffer === null || appending || queue.length === 0) return
+        if (mediaSource?.readyState !== 'open') return
+        if (sourceBuffer.updating) return
+        appending = true
+        try {
+          sourceBuffer.appendBuffer(queue.shift())
+        } catch {
+          appending = false
+        }
+      }
+      const attach = () => {
+        if (mediaSource === null || sourceBuffer !== null || codec === '') return
+        try {
+          sourceBuffer = mediaSource.addSourceBuffer(codec)
+        } catch {
+          options.onFail?.('codec')
+          return
+        }
+        sourceBuffer.mode = 'segments'
+        sourceBuffer.addEventListener('updateend', () => {
+          appending = false
+          try {
+            if (sourceBuffer !== null && sourceBuffer.buffered.length > 0) {
+              const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
+              const start = sourceBuffer.buffered.start(0)
+              /* 追到直播边缘，并扔掉 4 s 之前的，内存不会越吃越多。 */
+              if (end - video.currentTime > 1.2) video.currentTime = Math.max(start, end - 0.15)
+              if (end - start > 8 && sourceBuffer.updating === false) sourceBuffer.remove(start, end - 4)
+            }
+          } catch { /* 边界状态，忽略 */ }
+          appendNext()
+        })
+        appendNext()
+      }
+      const onFrame = (type, payload) => {
+        if (type === STREAM_META) {
+          const info = meta(payload)
+          if (info?.codec) codec = String(info.codec)
+          ensureSource()
+          return
+        }
+        if (type === STREAM_INIT) {
+          initPayload = payload
+          reset()
+          ensureSource()
+          return
+        }
+        if (type === STREAM_MEDIA) {
+          queue.push(payload)
+          /* 队列太长说明这台机器放不过来，丢到只剩最新几片，宁可卡一下也不无限堆积。 */
+          if (queue.length > 60) queue = queue.slice(-8)
+          appendNext()
+          return
+        }
+        if (type === STREAM_END) reset()
+      }
+      const session = async () => {
+        reset()
+        controller = new AbortController()
+        const res = await fetch(`${ROUTE}/stream?serial=${encodeURIComponent(serial)}&t=${Date.now()}`, {
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        if (!res.ok || res.body === null) throw new Error('stream')
+        const reader = res.body.getReader()
+        let buf = new Uint8Array(0)
+        while (!stopped) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buf = buf.length === 0 ? value : new Uint8Array([...buf, ...value])
+          while (buf.length >= 5) {
+            const type = buf[0]
+            const len = buf[1] * 16777216 + (buf[2] << 16) + (buf[3] << 8) + buf[4]
+            if (buf.length < 5 + len) break
+            const payload = buf.slice(5, 5 + len)
+            buf = buf.slice(5 + len)
+            onFrame(type, payload)
+          }
+        }
+      }
+      const run = async () => {
+        let backoff = 300
+        while (!stopped) {
+          try {
+            await session()
+            backoff = 300
+          } catch (error) {
+            if (stopped) return
+            if (options.onFail?.(String(error?.message ?? error)) === false) {
+              stopped = true
+              return
+            }
+            await sleep(backoff)
+            backoff = Math.min(4000, backoff * 2)
+            continue
+          }
+          if (stopped) return
+          await sleep(120)
+        }
+      }
+      video.muted = true
+      video.playsInline = true
+      video.autoplay = true
+      video.addEventListener('loadeddata', () => options.onReady?.())
+      video.addEventListener('loadedmetadata', () => options.onSize?.(video.videoWidth, video.videoHeight))
+      video.addEventListener('resize', () => options.onSize?.(video.videoWidth, video.videoHeight))
+      video.addEventListener('playing', () => options.onReady?.())
+      void video.play().catch(() => {})
+      void run()
+      return () => {
+        stopped = true
+        try { controller.abort() } catch { /* 已经关了 */ }
+        reset()
+      }
+    }
+
     function BodyView(props) {
       const sessionId = String(props?.sessionId ?? '')
       const [serial, setSerial] = React.useState('')
       const [devices, setDevices] = React.useState([])
-      const [mode, setMode] = React.useState('view')
+      const [mode, setMode] = React.useState('tap')
       const [note, setNote] = React.useState('')
       const [status, setStatus] = React.useState('')
       const [ready, setReady] = React.useState(false)
       const [screen, setScreen] = React.useState({ w: 0, h: 0 })
       const [frameSize, setFrameSize] = React.useState({ w: 0, h: 0 })
       const [streaming, setStreaming] = React.useState(false)
+      /* jpeg = 抓帧长轮询，mse = 持续推流；后者起来后前者自动停。 */
+      const [engine, setEngine] = React.useState('jpeg')
       const imgRef = React.useRef(null) // ui-copy-ignore
+      const videoRef = React.useRef(null) // ui-copy-ignore
       const frameRef = React.useRef(null) // ui-copy-ignore
       const canvasRef = React.useRef(null) // ui-copy-ignore
-      const strokes = React.useRef([]) // ui-copy-ignore
+      const strokes = React.useRef([])
+      /* 点下去先在本地画一个圈：设备那一帧要 0.7 s 才回来，圈让手感立刻有回应。 */
+      const taps = React.useRef([]) // ui-copy-ignore
       const drawing = React.useRef(null) // ui-copy-ignore
       const gesture = React.useRef(null) // ui-copy-ignore
+      const wheel = React.useRef({ dy: 0, x: 0, y: 0, timer: 0 }) // ui-copy-ignore
 
       /* 画布按显示尺寸重建，人画的线才和画面同尺度。 */
       const paint = React.useCallback(() => {
@@ -150,6 +333,15 @@ window.__ModuleLoader__.load({
           if (stroke.length === 1) ink.lineTo(stroke[0].x + 0.5, stroke[0].y + 0.5)
           ink.stroke()
         }
+        for (const tap of taps.current) {
+          ink.beginPath()
+          ink.arc(tap.x, tap.y, 18, 0, Math.PI * 2)
+          ink.stroke()
+          ink.beginPath()
+          ink.arc(tap.x, tap.y, 3, 0, Math.PI * 2)
+          ink.fillStyle = '#ff3b30'
+          ink.fill()
+        }
       }, [])
 
       /* 只在这一栏真的被人看见时收画面：切走、最小化、被别的页签盖住都停。 */
@@ -157,7 +349,9 @@ window.__ModuleLoader__.load({
         const node = frameRef.current
         const awake = () => document.visibilityState !== 'hidden'
         const decide = () => {
-          const box = node === null ? null : node.getBoundingClientRect()
+          /* 还没来帧时 .adbm-frame 没有尺寸，得看外层 stage 的位置，否则永远判成不可见。 */
+          const host = node === null ? null : (node.parentElement ?? node)
+          const box = host === null ? null : host.getBoundingClientRect()
           const onScreen = box !== null && box.width > 8 && box.height > 8 && box.bottom > 0 && box.top < window.innerHeight
           setStreaming(awake() && onScreen)
         }
@@ -198,6 +392,99 @@ window.__ModuleLoader__.load({
         return () => { live = false }
       }, [])
 
+      /* 优先走持续推流：画面一变，编码器那一帧几十毫秒就到；静止时零流量。
+         浏览器不支持、解码器不认这个 profile 时退回抓帧，画面不会断。 */
+      React.useEffect(() => {
+        if (serial === '' || !streaming) return undefined
+        if (typeof window.MediaSource !== 'function') return undefined
+        const video = videoRef.current
+        if (video === null) return undefined
+        let alive = true
+        let fails = 0
+        let painted = false
+        /* 2.5 s 还没出画面就退回抓帧，别让人对着黑屏等。 */
+        const watchdog = window.setTimeout(() => {
+          if (alive && !painted) setEngine('jpeg')
+        }, 2500)
+        const stop = startLiveVideo({
+          serial,
+          video,
+          onReady: () => {
+            if (!alive) return
+            painted = true
+            window.clearTimeout(watchdog)
+            setEngine('mse')
+            setReady(true)
+            paint()
+          },
+          onSize: (width, height) => {
+            if (alive && width > 0) setFrameSize({ w: width, h: height })
+          },
+          onFail: () => {
+            fails += 1
+            if (fails <= 2) return true
+            if (alive) setEngine('jpeg')
+            return false
+          },
+        })
+        return () => {
+          alive = false
+          window.clearTimeout(watchdog)
+          stop()
+        }
+      }, [serial, streaming, paint])
+
+      /* 面板长轮询取帧：服务端等到下一帧才回，客户端不用空转等待，
+         延迟只剩「抓一帧」本身。看不到时退到低频，窗口在后台就停下。 */
+      React.useEffect(() => {
+        if (serial === '' || engine === 'mse') return undefined
+        let live = true
+        let timer
+        let since = 0
+        let misses = 0
+        const visible = () => {
+          const node = frameRef.current
+          const host = node === null ? null : (node.parentElement ?? node)
+          const box = host === null ? null : host.getBoundingClientRect()
+          const onScreen = box !== null && box.width > 8 && box.height > 8 && box.bottom > 0 && box.top < window.innerHeight // ui-copy-ignore
+          setStreaming(document.visibilityState !== 'hidden' && onScreen)
+          return document.visibilityState !== 'hidden' && onScreen
+        }
+        const pull = async () => {
+          if (!live) return
+          if (!visible()) {
+            timer = setTimeout(pull, 700)
+            return
+          }
+          try {
+            const query = `serial=${encodeURIComponent(serial)}&since=${since}&wait=${misses === 0 ? 1500 : 0}&t=${Date.now()}` // ui-copy-ignore
+            const res = await fetch(`${ROUTE}/frame?${query}`, { cache: 'no-store' }) // ui-copy-ignore
+            if (!res.ok) throw new Error('还没有帧')
+            const blob = await res.blob()
+            since = Number(res.headers.get('x-adb-seq') ?? '') || since
+            if (!live) return
+            const img = imgRef.current
+            if (img !== null) {
+              const url = URL.createObjectURL(blob)
+              const prev = img.dataset.url
+              img.onload = () => {
+                if (prev !== undefined) URL.revokeObjectURL(prev)
+                img.dataset.url = url
+                setReady(true)
+                paint()
+              }
+              img.src = url
+            }
+            misses = 0
+          } catch {
+            misses += 1
+          }
+          if (live) timer = setTimeout(pull, misses === 0 ? 0 : Math.min(3000, 300 * misses))
+        }
+        void pull()
+        return () => { live = false; clearTimeout(timer) }
+      }, [serial, paint, engine])
+
       /* 画面尺寸与是否在直播：标注坐标要换算到设备像素，必须知道这两个数。 */
       React.useEffect(() => {
         if (serial === '') return undefined
@@ -210,6 +497,11 @@ window.__ModuleLoader__.load({
               if (Number(state?.screen?.w) > 0) setScreen({ w: Number(state.screen.w), h: Number(state.screen.h) })
               if (Number(state?.frame?.w) > 0) setFrameSize({ w: Number(state.frame.w), h: Number(state.frame.h) })
               setReady(state?.live === true)
+              const build = String(state?.build ?? '')
+              if (build !== '' && build !== window.__ADBM_BUILD) {
+                setStatus('正在载入新版本…')
+                window.location.reload()
+              }
             })
             .catch(() => {})
         }
@@ -217,6 +509,31 @@ window.__ModuleLoader__.load({
         const timer = setInterval(tick, 1500)
         return () => { live = false; clearInterval(timer) }
       }, [serial])
+
+      /* 一次性诊断：面板挂上了却不出画面时，把关键状态打到宿主，别靠猜。 */
+      React.useEffect(() => {
+        let n = 0
+        const beat = () => {
+          const img = imgRef.current
+          n += 1
+          report({
+            event: 'pane',
+            n,
+            serial,
+            streaming: streaming === true,
+            img: img === null ? 'none' : String(img.getAttribute('src') ?? '').slice(-26),
+            w: img?.naturalWidth ?? 0,
+            h: img?.naturalHeight ?? 0,
+            complete: img?.complete === true,
+            ready,
+            vis: document.visibilityState,
+            title: String(document.title ?? '').slice(0, 20),
+          })
+          if (n >= 6) clearInterval(timer)
+        }
+        const timer = setInterval(beat, 2500)
+        return () => clearInterval(timer)
+      }, [serial, streaming, ready])
 
       /**
        * 指针位置换成画布里的坐标。
@@ -249,7 +566,10 @@ window.__ModuleLoader__.load({
           paint()
           return
         }
-        gesture.current = { start: point, last: point }
+        gesture.current = { start: point, last: point, at: Date.now() }
+        taps.current = [{ x: point.x, y: point.y }]
+        paint()
+        setTimeout(() => { taps.current = []; paint() }, 500)
       }
 
       const onMove = (event) => {
@@ -274,11 +594,12 @@ window.__ModuleLoader__.load({
         const from = devicePoint(gestureNow.start)
         const to = devicePoint(gestureNow.last)
         const far = Math.abs(to.x - from.x) + Math.abs(to.y - from.y)
+        const held = Date.now() - (gestureNow.at ?? 0) >= 650
         const body = far < 12
           ? fetch(`${ROUTE}/tap`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ serial, x: from.x, y: from.y }),
+            body: JSON.stringify(held ? { serial, x: from.x, y: from.y, long: true } : { serial, x: from.x, y: from.y }),
           })
           : fetch(`${ROUTE}/swipe`, {
             method: 'POST',
@@ -286,6 +607,65 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ serial, x1: from.x, y1: from.y, x2: to.x, y2: to.y, ms: 260 }),
           })
         body.catch(() => setStatus(L('state.failed')))
+      }
+
+      /* 画布拿到焦点时，键入直接进设备：可见字符攒 150 ms 发一次，功能键立刻发。 */
+      const typeQueue = { text: '', timer: 0, serial: '' }
+      const flushText = () => {
+        typeQueue.timer = 0
+        const text = typeQueue.text
+        typeQueue.text = ''
+        if (text === '' || typeQueue.serial === '') return
+        fetch(`${ROUTE}/text`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ serial: typeQueue.serial, text }),
+        }).catch(() => setStatus(L('state.failed')))
+      }
+      const sendKey = (key) => {
+        fetch(`${ROUTE}/key`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ serial, key }),
+        }).catch(() => setStatus(L('state.failed')))
+      }
+      const onKey = (event) => {
+        if (mode === 'mark' || serial === '') return
+        const keys = { Enter: 'ENTER', Backspace: 'DEL', Tab: 'TAB', Escape: 'BACK', ArrowUp: 'DPAD_UP', ArrowDown: 'DPAD_DOWN', ArrowLeft: 'DPAD_LEFT', ArrowRight: 'DPAD_RIGHT' }
+        const named = keys[event.key]
+        if (named !== undefined) {
+          event.preventDefault()
+          if (typeQueue.timer !== 0) flushText()
+          sendKey(named)
+          return
+        }
+        if (event.key.length !== 1 || event.ctrlKey || event.metaKey || event.altKey) return
+        event.preventDefault()
+        typeQueue.text += event.key
+        typeQueue.serial = serial
+        if (typeQueue.timer === 0) typeQueue.timer = window.setTimeout(flushText, 150)
+      }
+
+      /* 鼠标滚轮 = 单指滑动：攒一小段再发，连续滚动不会每格打一次 adb。 */
+      const onWheel = (event) => {
+        if (mode === 'mark' || serial === '') return
+        event.preventDefault()
+        const point = pointOf(event)
+        wheel.current.dy += event.deltaY
+        wheel.current.x = point.x
+        wheel.current.y = point.y
+        if (wheel.current.timer !== 0) return
+        wheel.current.timer = window.setTimeout(() => {
+          const { dy, x, y } = wheel.current
+          wheel.current = { dy: 0, x: 0, y: 0, timer: 0 }
+          if (Math.abs(dy) < 8) return
+          const from = devicePoint({ x, y })
+          fetch(`${ROUTE}/scroll`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ serial, x: from.x, y: from.y, dy: Math.round(dy * 3) }),
+          }).catch(() => setStatus(L('state.failed')))
+        }, 120)
       }
 
       const clear = () => {
@@ -368,6 +748,28 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /* 不画任何东西，直接把最近几秒的画面 + 操作时间线推给 agent：
+         桌宠变大这类「刚才那几下之后不对劲」的问题，用这个最快。 */
+      const sendRecent = async () => {
+        if (serial === '') return
+        setStatus(L('state.starting'))
+        try {
+          const answer = await fetch(`${ROUTE}/annotate`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ serial, session: sessionId, note, recent: true, png: '', rect: null }),
+          }).then((res) => res.json())
+          if (answer?.ok === true) {
+            setStatus(L('state.sent'))
+            setNote('')
+          } else {
+            setStatus(String(answer?.reason ?? L('state.failed')))
+          }
+        } catch {
+          setStatus(L('state.failed'))
+        }
+      }
+
       const button = (value, label, onClick, extra) => h('button', {
         className: 'adbm-btn',
         'data-on': mode === value ? '1' : '0',
@@ -384,6 +786,11 @@ window.__ModuleLoader__.load({
             disabled: !ready,
             onClick: send,
           }, L('act.send')),
+          h('button', {
+            className: 'adbm-btn',
+            disabled: serial === '',
+            onClick: sendRecent,
+          }, L('act.recent')),
           strokes.current.length > 0 ? h('button', { className: 'adbm-btn', onClick: clear }, L('act.clear')) : null,
           h('span', { className: 'adbm-said' }, status || (ready ? '' : L('state.starting'))),
           devices.length > 1
@@ -398,6 +805,16 @@ window.__ModuleLoader__.load({
           h('div', { className: 'adbm-frame', ref: frameRef }, // ui-copy-ignore
             serial === ''
               ? null
+              : h('video', {
+                className: 'adbm-video',
+                ref: videoRef, // ui-copy-ignore
+                muted: true,
+                playsInline: true,
+                autoPlay: true,
+                style: { display: engine === 'mse' ? 'block' : 'none' },
+              }),
+            serial === '' || engine === 'mse'
+              ? null
               : h('img', {
                 className: 'adbm-img',
                 ref: imgRef, // ui-copy-ignore
@@ -405,7 +822,7 @@ window.__ModuleLoader__.load({
                 draggable: false,
                 /* 没人在看就断开：右栏切到别的页签、窗口在后台、面板滚出视野，
                    都不该让设备一直截图。重新被看见时这一条会自己接上。 */
-                src: streaming ? `${ROUTE}/live?serial=${encodeURIComponent(serial)}` : undefined, // ui-copy-ignore
+                /* 帧由上面的拉取循环塞进来；这里不给 src，免得同一路画面开两条。 */
                 onLoad: () => { setReady(true); paint() },
               }),
             h('canvas', {
@@ -416,6 +833,9 @@ window.__ModuleLoader__.load({
               onPointerMove: onMove,
               onPointerUp: onUp,
               onPointerCancel: onUp,
+              onWheel: onWheel,
+              tabIndex: 0,
+              onKeyDown: onKey,
             }),
           ),
         ),

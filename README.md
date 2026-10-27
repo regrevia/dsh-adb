@@ -3,10 +3,10 @@
 侧栏「实时ADB」：平板/手机画面按低帧率推进 DSH 右栏，鼠标点一下就是真机上点一下，在画面上圈一处再写一句话，带圈图和圈内控件一起回到会话里。插件内建，不需要额外 MCP、不需要独立 agent，也不上传任何画面——所有 HTTP 接口只监听 127.0.0.1，校验 peer / Host / Origin，伪造来源实测 403。
 
 ```bash
-git clone <这个仓库> dsh-adb
+git clone https://github.com/regrevia/dsh-adb.git dsh-adb
 cd dsh-adb
-# 在 DSH 里：plugin_manager action=install_bundle target=<克隆目录>/dsh-adb
-# 或直接把它写进 profile 的 package.json 依赖： "dsh-adb": "link:<克隆目录>/dsh-adb"
+# 在 DSH 里：plugin_manager action=install_bundle target=$HOME/dsh-adb
+# 或直接把它写进 profile 的 package.json 依赖： "dsh-adb": "link:$HOME/dsh-adb"
 ```
 
 环境变量（可选，都可不设）：`ADB`（adb 路径）、`ANDROID_SERIAL`（默认设备）、`FFMPEG`（转码路径）。见 `.env.example`。
@@ -99,13 +99,14 @@ cd dsh-adb
 | `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（262–376 ms） |
 | `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步 |
 | `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode` |
+| `adb_recent` | 最近几秒 6 帧拼图（读本地环形录像，不碰设备）：动效比例/位移/卡顿这类单帧看不出的问题用它 |
 | `adb_mirror` | 侧栏「实时ADB」：低帧率直播 + 手点 + 圈选推回会话；`status` / `peek` / `recent` / `stop` |
 
 ## 安装
 
 ```bash
 # 一次性：装进当前 profile（对所有会话生效）
-# 在 DSH 里用 plugin_manager：action=install_bundle, target=<克隆目录>/dsh-adb
+# 在 DSH 里用 plugin_manager：action=install_bundle, target=$HOME/dsh-adb
 ```
 
 装完 `plugin_manager list_plugins` 里应出现 `include:adb`（`enabled=true`、`fiberPhase=active`）。
@@ -200,3 +201,22 @@ node selftest.mjs --serial emulator-5554
 3. **WebView CDP**：拿到 DOM 文本与 JS 状态，替代 WebView 内稀疏的文本树。
 4. **手表/眼镜**：靠 `ro.build.characteristics=watch` 等做设备画像；圆屏按内切矩形裁剪点击坐标；走 `adb pair`/`adb connect` 的无线 ADB；GL 自绘界面文本树为空时回退截图。均【未核实】。
 5. **root 直读**：`shared_prefs`/`files` 已可读；数据库需 push 一个静态 `sqlite3` 二进制（当前系统无 sqlite3）。
+
+## 性能
+
+同一台测试机（小米平板 8，3200×2136，Android 15，USB 直连，宿主 macOS，2026-10）上的实测。下表数字均为实测；`约 1 帧/秒` 是内容驱动下的实测近似值，不是估算。
+
+| 能力 | 旧做法 | 现在 | 实测 |
+| --- | --- | --- | --- |
+| 截一张图 | `exec-out screencap -p` 出 PNG | `exec-out screencap -j` 设备端直出 JPEG，按右栏显示宽度缩放 | PNG 3.2 s / 8.9 MB → **330 ms**；900 px 34 KB，600 px 19 KB |
+| 读界面文本树 | `uiautomator dump` 每次冷启动 | uiautomator2 常驻服务直接读树 | dump 350 ms → **120 ms** |
+| 单条 adb 命令 | 每条 `execFile` 起一次 adb | 每台设备一条常驻 `adb shell` 通道 | **33 ms → 20 ms** |
+| 侧栏直播 | JPEG 长轮询逐帧抓（保留作兜底） | `screenrecord --output-format=h264` + ffmpeg 转 fMP4 + MSE | 960×640；首帧 **1380 ms**；画面一变到上屏 **+163 ms**；空闲约 1 帧/秒（`screenrecord` 内容驱动） |
+| 近 6 秒回看 | 连拍截图再拼 | 本地环形录像抽 6 帧拼图，不碰设备 | 6 帧拼图 **365 ms** |
+| 多步操作 | 一步一个工具往返 | `adb_do` 一次调用串起多步 | 2 步 **318 ms** |
+
+- 截图这条路省的是设备编码、回传体积和浏览器解码三段：PNG 3.2 s / 8.9 MB，JPEG 330 ms，900 px 34 KB、600 px 19 KB；右栏只显示几百 px 宽，按显示宽度缩放后体积和延迟一起降。
+- 读界面默认走文本树：uiautomator2 常驻 120 ms，比朴素 `uiautomator dump` 的 350 ms 快近 3 倍，返回的仍是可点的文字 + 资源 id + 坐标。
+- 每条命令的开销在通道不在命令：常驻 shell 把起进程的 33 ms 压到 20 ms。
+- 直播按内容驱动：H.264 960×640 在画面静止时约 1 帧/秒，变化到上屏 +163 ms；首帧 1380 ms 含页面加载与建流；MSE 起不来时仍退回 JPEG 长轮询。
+- `adb_recent` 的 365 ms 拼图不占设备（读本地环形录像），`adb_do` 2 步 318 ms 说明多步流程的瓶颈仍是设备侧动作，不是工具往返。

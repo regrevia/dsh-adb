@@ -66,6 +66,98 @@ const DEV = process.env.DSH_ADB_DEV === '1'
 const FFMPEG = pickFfmpeg()
 const FFPROBE = pickFfmpeg('ffprobe')
 
+/** 问 ffprobe 一段 mp4 有多长。 @param {string} file - 本地路径。 @returns {Promise<number>} 秒；读不到时 0。 */
+function probeDuration(file) {
+  return new Promise((resolve) => {
+    const child = spawn(FFPROBE, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file])
+    let out = ''
+    child.stdout.on('data', (chunk) => { out += chunk })
+    child.on('error', () => resolve(0))
+    child.on('close', () => resolve(Number(out.trim()) || 0))
+  })
+}
+
+/** 抽某一时刻的一帧 JPEG（宽 300），拼图用。 @returns {Promise<Buffer | null>} */
+function grabFrameAt(file, at) {
+  return new Promise((resolve) => {
+    const child = spawn(FFMPEG, ['-v', 'error', '-ss', at.toFixed(3), '-i', file, '-frames:v', '1',
+      '-vf', 'scale=-2:300', '-f', 'image2pipe', '-c:v', 'mjpeg', 'pipe:1'])
+    const chunks = []
+    child.stdout.on('data', (chunk) => chunks.push(chunk))
+    child.on('error', () => resolve(null))
+    child.on('close', () => resolve(chunks.length > 0 ? Buffer.concat(chunks) : null))
+  })
+}
+
+/** 问视频画面的原始宽高（像素）。 @returns {Promise<{ w: number, h: number } | null>} */
+function probeVideoSize(file) {
+  return new Promise((resolve) => {
+    const child = spawn(FFPROBE, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file])
+    let out = ''
+    child.stdout.on('data', (chunk) => { out += chunk })
+    child.on('error', () => resolve(null))
+    child.on('close', () => {
+      const [w, h] = out.trim().split(',').map((each) => Number(each))
+      resolve(Number(w) > 0 && Number(h) > 0 ? { w: Number(w), h: Number(h) } : null)
+    })
+  })
+}
+
+/**
+ * 按固定帧率把一段录像的末尾抽成灰度帧：动效量化要比对像素，不看 JPEG。
+ * @param {string} file - 本地 mp4。
+ * @param {number} seconds - 取末尾多少秒。
+ * @param {number} fps - 抽帧帧率。
+ * @param {{ x: number, y: number, w: number, h: number } | null} region - 只看这一块（原始像素坐标）。
+ * @returns {Promise<{ w: number, h: number, bytes: Buffer[] } | null>} 抽不到时 null。
+ */
+async function grayFrames(file, seconds, fps, region) {
+  const size = await probeVideoSize(file)
+  if (size === null) return null
+  const width = Math.min(320, Math.max(120, Math.round(size.w / 4)))
+  const scaled = Math.max(2, Math.round((width * size.h) / size.w / 2) * 2)
+  const filters = []
+  if (region !== null && region.w > 0 && region.h > 0) filters.push('crop=' + region.w + ':' + region.h + ':' + region.x + ':' + region.y)
+  filters.push('fps=' + fps)
+  filters.push('scale=' + width + ':' + scaled)
+  const frames = await new Promise((resolve) => {
+    const child = spawn(FFMPEG, ['-v', 'error', '-sseof', '-' + Math.max(1, seconds).toFixed(2), '-i', file,
+      '-vf', filters.join(','), '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'])
+    const chunks = []
+    let total = 0
+    child.stdout.on('data', (chunk) => {
+      chunks.push(chunk)
+      total += chunk.length
+      if (total > 64 * 1024 * 1024) child.kill('SIGKILL')
+    })
+    child.on('error', () => resolve(null))
+    child.on('close', () => resolve(chunks.length > 0 ? Buffer.concat(chunks) : null))
+  })
+  if (frames === null) return null
+  const frameBytes = width * scaled
+  if (frameBytes <= 0) return null
+  const count = Math.floor(frames.length / frameBytes)
+  if (count < 2) return null
+  const picked = []
+  for (let index = 0; index < count; index += 1) picked.push(frames.subarray(index * frameBytes, (index + 1) * frameBytes))
+  return { w: width, h: scaled, bytes: picked }
+}
+
+/** 6 帧 JPEG 拼成 3×2 的 PNG。 @returns {Promise<Buffer | null>} */
+function tileFrames(picks) {
+  return new Promise((resolve) => {
+    const child = spawn(FFMPEG, ['-v', 'error', '-f', 'image2pipe', '-framerate', '1', '-c:v', 'mjpeg', '-i', 'pipe:0',
+      '-vf', 'scale=-2:300,tile=3x2:padding=6:color=0x222222', '-frames:v', '1', '-c:v', 'png', '-f', 'image2pipe', 'pipe:1'])
+    const chunks = []
+    let settled = false
+    child.stdout.on('data', (chunk) => chunks.push(chunk))
+    child.on('error', () => { if (!settled) { settled = true; resolve(null) } })
+    child.on('close', () => { if (!settled) { settled = true; resolve(chunks.length > 0 ? Buffer.concat(chunks) : null) } })
+    for (const jpeg of picks.slice(0, 6)) child.stdin.write(jpeg)
+    child.stdin.end()
+  })
+}
+
 /** 环形缓冲落盘位置：本机私有目录，不随工作区进版本库。 */
 const ROOT = join(homedir(), '.dsh', 'adb-mirror')
 
@@ -340,52 +432,220 @@ export class Mirror {
    * @param {number} seconds - 回看多少秒。
    * @returns {Promise<Buffer | null>} PNG 拼图；抽不到时 null。
    */
+  /**
+   * 从最近一段磁盘录像里抽帧拼图（没人看直播时的兜底）。
+   * @param {number} seconds - 回看多少秒。
+   * @returns {Promise<Buffer | null>} PNG 拼图；抽不到时 null。
+   */
   async recentStripFromDisk(seconds = 6) {
     const list = await this.segments()
     if (list.length === 0) return null
     for (const item of list.slice(-2).reverse()) {
-      const file = join(this.dir, item.segment)
-      /* 段是 10s 的 screenrecord 产物：末尾那段可能还在写，先问时长再定窗口。 */
-      const duration = await new Promise((resolve) => {
-        const child = spawn(FFPROBE, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file])
-        let out = ""
-        child.stdout.on("data", (chunk) => { out += chunk })
-        child.on("error", () => resolve(0))
-        child.on("close", () => resolve(Number(out.trim()) || 0))
-      })
-      if (!(duration > 0.6)) continue
-      const window = Math.min(seconds, duration)
-      const step = window / 6
-      const picks = []
-      for (let index = 0; index < 6; index += 1) {
-        const at = Math.max(0, duration - window + (index * step))
-        const jpeg = await new Promise((resolve) => {
-          const child = spawn(FFMPEG, ["-v", "error", "-ss", at.toFixed(3), "-i", file, "-frames:v", "1",
-            "-vf", "scale=-2:300", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"])
-          const chunks = []
-          child.stdout.on("data", (chunk) => chunks.push(chunk))
-          child.on("error", () => resolve(null))
-          child.on("close", () => resolve(chunks.length > 0 ? Buffer.concat(chunks) : null))
-        })
-        if (jpeg === null) break
-        picks.push(jpeg)
-      }
-      if (picks.length < 3) continue
-      while (picks.length < 6) picks.push(picks[picks.length - 1])
-      const strip = await new Promise((resolve) => {
-        const child = spawn(FFMPEG, ["-v", "error", "-f", "image2pipe", "-framerate", "1", "-c:v", "mjpeg", "-i", "pipe:0",
-          "-vf", "scale=-2:300,tile=3x2:padding=6:color=0x222222", "-frames:v", "1", "-c:v", "png", "-f", "image2pipe", "pipe:1"])
-        const chunks = []
-        let settled = false
-        child.stdout.on("data", (chunk) => chunks.push(chunk))
-        child.on("error", () => { if (!settled) { settled = true; resolve(null) } })
-        child.on("close", () => { if (!settled) { settled = true; resolve(chunks.length > 0 ? Buffer.concat(chunks) : null) } })
-        for (const jpeg of picks.slice(0, 6)) child.stdin.write(jpeg)
-        child.stdin.end()
-      })
+      const strip = await this.stripFromFile(join(this.dir, item.segment), seconds)
       if (strip !== null) return strip
     }
     return null
+  }
+
+  /**
+   * 从一段录像的末尾抽帧拼成 3×2 PNG。
+   * @param {string} file - 本地 mp4。
+   * @param {number} seconds - 取末尾多少秒。
+   * @returns {Promise<Buffer | null>} PNG；抽不到时 null。
+   */
+  async stripFromFile(file, seconds = 6) {
+    /* 段是 screenrecord 产物：末尾那段可能还在写，先问时长再定窗口。 */
+    const duration = await probeDuration(file)
+    if (!(duration > 0.6)) return null
+    const window = Math.min(seconds, duration)
+    const step = window / 6
+    const picks = []
+    for (let index = 0; index < 6; index += 1) {
+      const at = Math.max(0, duration - window + (index * step))
+      const jpeg = await grabFrameAt(file, at)
+      if (jpeg === null) break
+      picks.push(jpeg)
+    }
+    if (picks.length < 3) return null
+    while (picks.length < 6) picks.push(picks[picks.length - 1])
+    return tileFrames(picks)
+  }
+
+  /**
+   * 磁盘上最近一段录像有多旧：超过宽限就不能再拿它充「近几秒」。
+   * @returns {Promise<number>} 毫秒；一段都没有时 Infinity。
+   */
+  async segmentAge() {
+    const list = await this.segments()
+    if (list.length === 0) return Number.POSITIVE_INFINITY
+    return Math.max(0, Date.now() - list[list.length - 1].at)
+  }
+
+  /**
+   * 现场录一小段再拉回本机：绕开大文件、秒级出结果，代价是这条命令本身要跑满时长。
+   * @param {number} seconds - 录几秒（2–12）。
+   * @returns {Promise<string | null>} 本地 mp4 路径；起不来时 null（例如直播正占着编码器）。
+   */
+  async captureBurst(seconds = 4) {
+    const span = Math.min(12, Math.max(2, Math.round(seconds)))
+    const remote = `/sdcard/dsh-burst-${this.serial.replace(/[^\w.-]/g, '_')}.mp4`
+    const began = Date.now()
+    const t0 = Date.now()
+    const recorded = await this.adb([
+      '-s', this.serial, 'shell', 'screenrecord',
+      '--time-limit', String(span), '--bit-rate', '2000000', '--size', '960x640', remote,
+    ], { timeout: (span + 15) * 1000, direct: true }).catch(() => null)
+    if (!recorded || !recorded.ok) return null
+    const t1 = Date.now()
+    const pulled = await this.adb(['-s', this.serial, 'exec-out', 'cat', remote], { timeout: 60_000, direct: true }).catch(() => null)
+    const t2 = Date.now()
+    await this.adb(['-s', this.serial, 'shell', 'rm', '-f', remote], { timeout: 8000 }).catch(() => {})
+    if (!pulled || !pulled.ok || !Buffer.isBuffer(pulled.raw) || pulled.raw.length < 4096) return null
+    const file = join(this.dir, `burst-${began}.mp4`)
+    await writeFile(file, pulled.raw).catch(() => null)
+    this.lastBurstTiming = { record_ms: t1 - t0, pull_ms: t2 - t1 }
+    return existsSync(file) ? file : null
+  }
+
+  /**
+   * 取一段「刚刚」的录像文件给逐像素分析用：磁盘段够新就白用，不够新就现场录。
+   * @param {number} seconds - 需要多长。
+   * @returns {Promise<{ file: string, source: 'disk' | 'burst', ageMs: number, temp: boolean } | null>}
+   */
+  async recentClip(seconds = 4, force = false) {
+    const list = await this.segments()
+    if (list.length > 0 && !force) {
+      const last = list[list.length - 1]
+      const age = Math.max(0, Date.now() - last.at)
+      const file = join(this.dir, last.segment)
+      const duration = await probeDuration(file)
+      if (age < 15_000 && duration >= Math.min(seconds, 1)) return { file, source: 'disk', ageMs: age, temp: false }
+    }
+    const burst = await this.captureBurst(seconds + 1)
+    if (burst !== null) return { file: burst, source: 'burst', ageMs: 0, temp: true }
+    if (list.length === 0) return null
+    const last = list[list.length - 1]
+    return { file: join(this.dir, last.segment), source: 'disk', ageMs: Math.max(0, Date.now() - last.at), temp: false }
+  }
+
+  /**
+   * 逐像素动效时间线：每帧相对上一帧变了多大、变在哪、抖了几下、多久稳住。
+   * 桌宠、悬浮窗、自绘动画在控件树里看不见，只能这样量。
+   * @param {object} options - seconds / fps / region / threshold。
+   * @returns {Promise<object | null>} 指标与逐帧序列。
+   */
+  async motionTimeline(options = {}) {
+    const seconds = Math.min(12, Math.max(2, Number(options.seconds ?? 4)))
+    const fps = Math.min(10, Math.max(2, Number(options.fps ?? 8)))
+    const threshold = Math.min(64, Math.max(2, Number(options.threshold ?? 12)))
+    const region = options.region ?? null
+    const clip = await this.recentClip(seconds, options.force === true)
+    if (clip === null) return null
+    try {
+      const gray = await grayFrames(clip.file, seconds, fps, region)
+      if (gray === null) return null
+      const scale = region !== null && region.w > 0 ? region.w / gray.w : null
+      const size = await probeVideoSize(clip.file)
+      const factor = scale ?? (size === null ? 1 : size.w / gray.w)
+      const frames = []
+      const series = []
+      for (let index = 1; index < gray.bytes.length; index += 1) {
+        const before = gray.bytes[index - 1]
+        const after = gray.bytes[index]
+        let changed = 0
+        let minX = gray.w
+        let minY = gray.h
+        let maxX = -1
+        let maxY = -1
+        for (let at = 0; at < after.length; at += 1) {
+          if (Math.abs(after[at] - before[at]) <= threshold) continue
+          changed += 1
+          const x = at % gray.w
+          const y = (at - x) / gray.w
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
+          if (y < minY) minY = y
+          if (y > maxY) maxY = y
+        }
+        const boxed = maxX >= minX && maxY >= minY
+        const box = boxed
+          ? { x: Math.round(minX * factor), y: Math.round(minY * factor), w: Math.round((maxX - minX + 1) * factor), h: Math.round((maxY - minY + 1) * factor) }
+          : { x: 0, y: 0, w: 0, h: 0 }
+        const frame = {
+          t: Math.round((index / fps) * 1000),
+          changed_pct: Number(((changed / after.length) * 100).toFixed(2)),
+          box,
+        }
+        frames.push(frame)
+        series.push(box.w === 0 && box.h === 0 ? 0 : Math.round(Math.sqrt((box.w * box.w) + (box.h * box.h))))
+      }
+      const peak = Math.max(...series, 0)
+      const tail = series.length > 0 ? series[series.length - 1] : 0
+      let jitter = 0
+      let previousSign = 0
+      let biggestStep = 0
+      let biggestStepAt = 0
+      for (let index = 1; index < series.length; index += 1) {
+        const delta = series[index] - series[index - 1]
+        if (Math.abs(delta) >= Math.max(2, peak * 0.08)) {
+          const sign = Math.sign(delta)
+          if (previousSign !== 0 && sign !== previousSign) jitter += 1
+          previousSign = sign
+        }
+        if (Math.abs(delta) > biggestStep) { biggestStep = Math.abs(delta); biggestStepAt = index }
+      }
+      let settleMs = 0
+      if (peak > 0) {
+        const calmAt = series.findIndex((value, index) => index > 1 && Math.abs(value - tail) <= Math.max(2, peak * 0.06))
+        settleMs = calmAt > 0 ? Math.round(((calmAt - biggestStepAt) / fps) * 1000) : 0
+        if (settleMs < 0) settleMs = 0
+      }
+      return {
+        source: clip.source,
+        age_ms: clip.ageMs,
+        record_ms: this.lastBurstTiming?.record_ms ?? 0,
+        pull_ms: this.lastBurstTiming?.pull_ms ?? 0,
+        fps,
+        frames: frames.length,
+        device: size === null ? null : { w: size.w, h: size.h },
+        peak_size_px: peak,
+        tail_size_px: tail,
+        overshoot_pct: tail > 0 ? Number((((peak - tail) / tail) * 100).toFixed(1)) : 0,
+        biggest_step_px: biggestStep,
+        biggest_step_at_ms: Math.round(((biggestStepAt + 1) / fps) * 1000),
+        jitter,
+        settle_ms: settleMs,
+        series,
+        timeline: frames,
+      }
+    } finally {
+      if (clip.temp) await rm(clip.file, { force: true }).catch(() => {})
+    }
+  }
+
+  /**
+   * 「刚才那几秒」：优先真近的帧，并如实交代来源——内存直播帧 / 近 25 秒的磁盘段 / 现场现录。
+   * 之前它可能拿几分钟前的旧段拼图，看着像回看其实是旧的，这里把这件事钉死。
+   * @param {number} seconds - 回看多少秒。
+   * @returns {Promise<{ png: Buffer, source: 'live' | 'burst' | 'disk', ageMs: number } | null>}
+   */
+  async recentStripWithSource(seconds = 6) {
+    const newest = this.recent.length > 0 ? this.recent[this.recent.length - 1].at : 0
+    if (newest > 0 && Date.now() - newest < 8000) {
+      const png = await this.recentStrip(seconds)
+      if (png !== null) return { png, source: 'live', ageMs: 0 }
+    }
+    const age = await this.segmentAge()
+    if (!Number.isFinite(age) || age > 25_000) {
+      const file = await this.captureBurst(seconds)
+      if (file !== null) {
+        const png = await this.stripFromFile(file, seconds + 0.5)
+        await rm(file, { force: true }).catch(() => {})
+        if (png !== null) return { png, source: 'burst', ageMs: 0 }
+      }
+    }
+    const png = await this.recentStripFromDisk(seconds)
+    return png === null ? null : { png, source: 'disk', ageMs: age }
   }
 
   /**
@@ -470,14 +730,14 @@ export class Mirror {
         '-s', this.serial, 'shell', 'screenrecord',
         '--time-limit', String(SEGMENT_SECONDS),
         '--bit-rate', '2000000', '--size', '960x640', remote,
-      ], { timeout: (SEGMENT_SECONDS + 20) * 1000 })
+      ], { timeout: (SEGMENT_SECONDS + 20) * 1000, direct: true })
       if (this.stopping) break
       if (!recorded.ok) {
         this.error = recorded.err.trim().slice(0, 200) || '录制失败'
         await new Promise((resolve) => setTimeout(resolve, 1500))
         continue
       }
-      const pulled = await this.adb(['-s', this.serial, 'exec-out', 'cat', remote], { timeout: 60_000 })
+      const pulled = await this.adb(['-s', this.serial, 'exec-out', 'cat', remote], { timeout: 60_000, direct: true })
       await this.adb(['-s', this.serial, 'shell', 'rm', '-f', remote], { timeout: 8000 })
       const bytes = pulled.raw
       if (pulled.ok && Buffer.isBuffer(bytes) && bytes.length > 2048) {
@@ -1108,14 +1368,23 @@ export function setupMirror(ctx, tools) {
      * @param {number} seconds - 回看秒数。
      * @returns {Promise<{ ok: boolean, path?: string, bytes?: number }>} 结果。
      */
+    /**
+     * 逐像素动效时间线：问「刚才那下哪里不协调」时用。
+     * @param {string} serial - 设备。
+     * @param {object} options - seconds / fps / region / threshold。
+     * @returns {Promise<object | null>} 指标。
+     */
+    async motion(serial, options = {}) {
+      return mirrorFor(serial).motionTimeline(options)
+    },
     async recentStrip(serial, seconds = 6) {
       const mirror = mirrorFor(serial)
-      const strip = await mirror.recentStrip(seconds)
-      if (strip === null) return { ok: false }
+      const found = await mirror.recentStripWithSource(seconds)
+      if (found === null) return { ok: false }
       const file = join(ROOT, `recent-${serial.replace(/[^\w.-]/g, "_")}-${Date.now()}.png`)
       await mkdir(dirname(file), { recursive: true })
-      await writeFile(file, strip)
-      return { ok: true, path: file, bytes: strip.length }
+      await writeFile(file, found.png)
+      return { ok: true, path: file, bytes: found.png.length, source: found.source, ageMs: found.ageMs }
     },
     async status(serial) {
       const chosen = serial ?? await tools.resolveSerial().catch(() => '')

@@ -473,6 +473,7 @@ function parseNodes(xml) {
       depth: stack.length,
       text: read('text'),
       id: read('resource-id'),
+      pkg: read('package'),
       cls: read('class'),
       desc: read('content-desc'),
       clickable: read('clickable') === 'true',
@@ -1979,7 +1980,266 @@ export function apply(ctx, config) {
     },
   }), 'adb: adb_anim')
 
-  ctx.effect(() => ctx.tools.register({
+  /**
+ * 把一次 dump 的节点按 depth 0 切成窗口块：u2 的 dumpWindowHierarchy 会把所有
+ * 可见窗口（前台页、悬浮桌宠、状态栏、输入法）塞进同一棵 hierarchy，depth 0 就是窗口根。
+ * @param {any[]} nodes - parseNodes 的结果。
+ * @returns {Array<{root: any, nodes: any[]}>} 窗口列表，按层级顺序。
+ */
+function splitWindows(nodes) {
+  const out = []
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (nodes[i].depth !== 0) continue
+    let end = nodes.length
+    for (let k = i + 1; k < nodes.length; k += 1) {
+      if (nodes[k].depth === 0) { end = k; break }
+    }
+    out.push({ root: nodes[i], nodes: nodes.slice(i, end) })
+  }
+  return out
+}
+
+/**
+ * 窗口里的一行控件：id + 类名 + [宽×高 @x,y] + 文字。
+ * @param {any} node - 节点。
+ * @param {number} indent - 缩进层数。
+ * @returns {string} 行。
+ */
+function windowLine(node, indent) {
+  const w = Math.max(0, node.x2 - node.x1)
+  const h = Math.max(0, node.y2 - node.y1)
+  const cls = node.cls ? node.cls.replace(/^android\.(widget|view|webkit)\./, '') : 'View'
+  const parts = [`${'  '.repeat(indent)}${node.id ? '#' + shortId(node.id) + ' ' : ''}${cls}`]
+  if (w || h) parts.push('[' + w + '×' + h + ' @' + node.x1 + ',' + node.y1 + ']')
+  if (node.text) parts.push('"' + oneLine(node.text, 32) + '"')
+  if (node.desc) parts.push('~"' + oneLine(node.desc, 24) + '"')
+  if (node.clickable || node.longClickable) parts.push('*')
+  return parts.join(' ')
+}
+
+/**
+ * 在节点里按选择器找控件：先精确文字，再子串；id/desc/class 都按子串匹配。
+ * @param {any[]} nodes - 节点。
+ * @param {{id?: string, text?: string, desc?: string, cls?: string}} sel - 选择器。
+ * @returns {any|null} 命中的节点。
+ */
+function matchNode(nodes, sel) {
+  const pick = (pool) => {
+    for (const node of pool) {
+      if (sel.id && !node.id.includes(sel.id)) continue
+      if (sel.cls && !node.cls.includes(sel.cls)) continue
+      if (sel.desc && !node.desc.includes(sel.desc)) continue
+      if (sel.text && !node.text.includes(sel.text)) continue
+      return node
+    }
+    return null
+  }
+  return pick(nodes.filter((node) => !sel.text || node.text === sel.text)) || pick(nodes)
+}
+
+ctx.effect(() => ctx.tools.register({
+  name: 'adb_window',
+  description: [
+    '按「窗口」看界面：一次 dump 列出所有可见窗口（前台页、悬浮窗/桌宠、状态栏、输入法），给包名、尺寸、位置和窗口内控件树。',
+    'adb_ui 只读前台页面的文字树；要确认悬浮控件多大、弹窗/悬浮窗谁在上面、桌宠这类独立窗口里有什么（含气泡文字），用这个。一次约 50ms。',
+  ].join(' '),
+  parameters: {
+    type: 'object',
+    properties: {
+      filter: { type: 'string', description: '只留包名/文字/id 包含这段的窗口' },
+      full: { type: 'boolean', description: '连没有文字/id 的结构容器也展开；默认只展开有文字、id 浅层或可点的节点' },
+      max_nodes: { type: 'integer', description: '最多返回多少行，默认 ' + MAX_NODES.default },
+    },
+    additionalProperties: false,
+  },
+  output: {
+    schema: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string' },
+        activity: { type: 'string' },
+        summary: { type: 'string' },
+        tree: { type: 'string' },
+        windows: { type: 'integer' },
+        elapsed_ms: { type: 'integer' },
+      },
+      required: ['serial', 'activity', 'summary', 'tree', 'windows', 'elapsed_ms'],
+      additionalProperties: false,
+    },
+    render: (_args, value) => textBlock(value.summary + '\n' + value.tree),
+  },
+  execute: async (args) => {
+    const device = await serial()
+    const began = Date.now()
+    const [xml, activity] = await Promise.all([u2Dump(device), foregroundActivity(device).catch(() => '')])
+    const nodes = parseNodes(xml)
+    const wins = splitWindows(nodes)
+    const full = args.full === true
+    const maxNodes = Math.min(Math.max(args.max_nodes ?? MAX_NODES.default, 1), MAX_NODES.max)
+    const needle = String(args.filter ?? '').toLowerCase()
+    const lines = []
+    let kept = 0
+    for (const win of wins) {
+      const w = Math.max(0, win.root.x2 - win.root.x1)
+      const h = Math.max(0, win.root.y2 - win.root.y1)
+      const head = '⌗ ' + (win.root.pkg || '未知包') + ' · ' + w + '×' + h + ' @' + win.root.x1 + ',' + win.root.y1 + ' · ' + win.nodes.length + ' 节点'
+      const body = []
+      for (const node of win.nodes.slice(1)) {
+        if (kept >= maxNodes) break
+        const deep = node.depth <= 3 && Boolean(node.id)
+        const show = full ? Boolean(node.id || node.text || node.desc || node.clickable) : Boolean(node.text || node.desc || node.clickable || deep)
+        if (!show) continue
+        body.push(windowLine(node, Math.min(node.depth, 6)))
+        kept += 1
+      }
+      if (needle && !(head + '\n' + windowLine(win.root, 0) + '\n' + body.join('\n')).toLowerCase().includes(needle)) continue
+      lines.push(head, windowLine(win.root, 0), ...body)
+    }
+    const summary = [
+      device + ' · ' + (activity || '未知页面'),
+      wins.length + ' 个窗口 · ' + kept + ' 节点' + (needle ? ' · 过滤 ' + JSON.stringify(String(args.filter)) : ''),
+      Date.now() - began + 'ms',
+      lines.length === 0 ? '没有匹配的窗口' : '',
+    ].filter(Boolean).join(' · ')
+    return {
+      serial: device,
+      activity,
+      summary,
+      tree: lines.join('\n') || '（没有匹配的窗口）',
+      windows: wins.length,
+      elapsed_ms: Date.now() - began,
+    }
+  },
+}))
+
+ctx.effect(() => ctx.tools.register({
+  name: 'adb_watch',
+  description: [
+    '采样一个控件的几何随时间变化：按 id/text/class 选一个控件，连续读它的宽高与位置，给出变化序列、最大单步、抖动次数、多久稳住。',
+    '用来量化「刚才那个东西大小/位置变化不协调」这类问题——动画内嵌在 WebView 画布里时几何可能全程不变，那就换 adb_motion 量像素；两者互补。',
+    'id/text/class 三选一，先 adb_ui 拿 id 或文字。默认采样 3 秒、约 10 次/秒，每次 dump 约 46ms。',
+  ].join(' '),
+  parameters: {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: '资源 id，可只写后半段，如 petRoot' },
+      text: { type: 'string', description: '控件文字（精确优先，其次包含）' },
+      desc: { type: 'string', description: 'content-desc 内容' },
+      class: { type: 'string', description: '类名子串，如 EditText' },
+      seconds: { type: 'integer', description: '采样时长，默认 3，最多 15' },
+      fps: { type: 'integer', description: '采样频率，默认 10，最多 15' },
+    },
+    additionalProperties: false,
+  },
+  output: {
+    schema: {
+      type: 'object',
+      properties: {
+        serial: { type: 'string' },
+        selector: { type: 'string' },
+        summary: { type: 'string' },
+        detail: { type: 'string' },
+        samples: { type: 'integer' },
+        changes: { type: 'integer' },
+        series: { type: 'string' },
+        biggest_step_px: { type: 'integer' },
+        settle_ms: { type: 'integer' },
+        matched: { type: 'boolean' },
+        elapsed_ms: { type: 'integer' },
+      },
+      required: ['serial', 'selector', 'summary', 'detail', 'samples', 'changes', 'series', 'biggest_step_px', 'settle_ms', 'matched', 'elapsed_ms'],
+      additionalProperties: false,
+    },
+    render: (_args, value) => textBlock(value.summary + '\n' + value.detail),
+  },
+  execute: async (args) => {
+    const device = await serial()
+    const began = Date.now()
+    const sel = { id: args.id, text: args.text, desc: args.desc, cls: args.class }
+    if (!sel.id && !sel.text && !sel.desc && !sel.cls) throw new Error('需要 id、text、desc 或 class 其中之一。')
+    const label = Object.entries(sel).filter(([, v]) => v).map(([k, v]) => k + '=' + v).join(' ')
+    const seconds = Math.min(Math.max(args.seconds ?? 3, 1), 15)
+    const fps = Math.min(Math.max(args.fps ?? 10, 2), 15)
+    const gap = Math.round(1000 / fps)
+    const deadline = Date.now() + seconds * 1000
+    const t0 = Date.now()
+    const raw = []
+    let lastError = ''
+    while (Date.now() < deadline) {
+      const started = Date.now()
+      try {
+        const node = matchNode(parseNodes(await u2Dump(device)), sel)
+        raw.push(node
+          ? { t: started - t0, w: node.x2 - node.x1, h: node.y2 - node.y1, x: node.x1, y: node.y1 }
+          : { t: started - t0, missing: true })
+      } catch (error) {
+        lastError = String(error?.message ?? error)
+        raw.push({ t: started - t0, missing: true })
+      }
+      const left = gap - (Date.now() - started)
+      if (left > 0) await new Promise((resolve) => setTimeout(resolve, left))
+    }
+    const hits = raw.filter((s) => !s.missing)
+    const matched = hits.length > 0
+    const real = []
+    for (const s of hits) {
+      const prev = real[real.length - 1]
+      if (prev && prev.w === s.w && prev.h === s.h && prev.x === s.x && prev.y === s.y) continue
+      real.push(s)
+    }
+    let biggest = 0
+    let biggestAt = 0
+    let jitter = 0
+    let lastDir = 0
+    let lastChange = 0
+    const series = []
+    for (let i = 0; i < real.length; i += 1) {
+      const cur = real[i]
+      series.push(cur.w + '×' + cur.h)
+      if (i === 0) continue
+      const prev = real[i - 1]
+      const step = Math.max(Math.abs(cur.w - prev.w), Math.abs(cur.h - prev.h), Math.abs(cur.x - prev.x), Math.abs(cur.y - prev.y))
+      lastChange = cur.t
+      if (step > biggest) { biggest = step; biggestAt = cur.t }
+      const dir = Math.sign(cur.x - prev.x) || Math.sign(cur.w - prev.w)
+      if (step >= 3 && dir !== 0) {
+        if (lastDir !== 0 && dir !== lastDir) jitter += 1
+        lastDir = dir
+      }
+    }
+    const changes = Math.max(0, real.length - 1)
+    const first = real[0]
+    const last = real[real.length - 1]
+    const settle = changes === 0 ? 0 : Math.max(0, raw[raw.length - 1].t - lastChange)
+    const avgGap = hits.length > 1 ? Math.round((hits[hits.length - 1].t - hits[0].t) / (hits.length - 1)) : 0
+    let verdict
+    if (!matched) {
+      verdict = '没找到匹配控件（' + label + '）' + (lastError ? '：' + lastError : '') + '；先 adb_ui 看树确认 id/文字'
+    } else if (changes === 0) {
+      verdict = '几何没变：' + hits.length + ' 次采样（约 ' + avgGap + 'ms 一次），始终 ' + first.w + '×' + first.h + ' @' + first.x + ',' + first.y + '；若肉眼在动，说明动画在 WebView 画布内部，用 adb_motion 量像素'
+    } else {
+      verdict = '尺寸 ' + first.w + '×' + first.h + ' → ' + last.w + '×' + last.h + '，位置 ' + first.x + ',' + first.y + ' → ' + last.x + ',' + last.y + '，' + changes + ' 次几何变化，最大单步 ' + biggest + 'px' + (biggestAt ? '（' + biggestAt + 'ms）' : '') + '，' + (settle === 0 ? '末尾仍在变' : settle + 'ms 后稳住') + (jitter ? '，方向反复 ' + jitter + ' 次' : '')
+    }
+    const detail = matched
+      ? ['序列：' + series.join(' → '), '采样 ' + hits.length + '/' + raw.length + ' 次命中，平均间隔 ' + avgGap + 'ms'].join('\n')
+      : ''
+    return {
+      serial: device,
+      selector: label,
+      summary: verdict + '（总 ' + (Date.now() - began) + 'ms）',
+      detail,
+      samples: hits.length,
+      changes,
+      series: series.join(','),
+      biggest_step_px: biggest,
+      settle_ms: settle,
+      matched,
+      elapsed_ms: Date.now() - began,
+    }
+  },
+}))
+
+ctx.effect(() => ctx.tools.register({
     name: 'adb_proc',
     description: '看设备上的进程与内存：top 给最吃 CPU 的进程，mem 给指定包的内存明细，list 列进程。排查卡顿/被杀/内存涨先看这里。',
     parameters: {
@@ -2336,10 +2596,11 @@ export function apply(ctx, config) {
           path: { type: 'string' },
           seconds: { type: 'integer' },
           bytes: { type: 'integer' },
+          source: { type: 'string' },
           message: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['path', 'seconds', 'bytes', 'message', 'elapsed_ms'],
+        required: ['path', 'seconds', 'bytes', 'source', 'message', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.message),
@@ -2350,17 +2611,97 @@ export function apply(ctx, config) {
       const seconds = Math.min(12, Math.max(2, Number(args.seconds ?? 6)))
       const strip = await mirror.recentStrip(device, seconds)
       if (strip.ok !== true) {
-        return { path: '', seconds, bytes: 0, message: '最近没有录到画面：等侧栏直播出过几帧，或先用 adb_shot 抓一张再试。', elapsed_ms: Date.now() - began }
+        return { path: '', seconds, bytes: 0, source: 'none', message: `最近没有录到画面：现场录屏没起来（可能侧栏直播正占着编码器），改用 adb_shot 抓单帧。`, elapsed_ms: Date.now() - began }
       }
+      /* 来源必须如实报：磁盘段可能是几分钟前的，拿旧帧当「刚才」会把人带错方向。 */
+      const origin = strip.source === 'live'
+        ? '直播内存帧'
+        : strip.source === 'burst'
+          ? '现场现录'
+          : `磁盘录像（最后一段 ${Math.round((strip.ageMs ?? 0) / 1000)} 秒前，不是刚刚）`
       return {
         path: strip.path,
         seconds,
         bytes: strip.bytes,
-        message: `最近 ${seconds} 秒的 6 帧拼图：${strip.path}（${Math.round((strip.bytes ?? 0) / 1024)}KB，${Date.now() - began}ms）。看动效比例/位移用 read_image。`,
+        source: strip.source ?? 'none',
+        message: `${origin}：${seconds} 秒窗口的 6 帧拼图 ${strip.path}（${Math.round((strip.bytes ?? 0) / 1024)}KB，${Date.now() - began}ms）。看动效比例/位移用 read_image。`,
         elapsed_ms: Date.now() - began,
       }
     },
   }), 'adb: adb_recent')
+
+  ctx.effect(() => ctx.tools.register({
+    name: 'adb_motion',
+    description: '逐像素量化「刚才那几秒」的动效：每帧变了多大、变在哪、抖了几下、多久稳住。桌宠/悬浮窗/自绘动画在控件树里看不见，比例不协调、跳变、回弹过头用这个量，别用眼睛猜。',
+    parameters: {
+      type: 'object',
+      properties: {
+        seconds: { type: 'integer', description: '回看几秒，默认 4（2–12）' },
+        fps: { type: 'integer', description: '抽帧帧率，默认 8（2–10）' },
+        region: { type: 'string', description: '只看这一块，格式 "x,y,w,h"（设备像素），例如桌宠所在角落' },
+        threshold: { type: 'integer', description: '像素差阈值，默认 12（2–64）；屏幕有噪点/渐变时调高' },
+        force: { type: 'boolean', description: '不管有没有近的磁盘录像，都现在录一段再量（复现/对比时用，多花约 4 秒）' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string' },
+          source: { type: 'string' },
+          peak_size_px: { type: 'integer' },
+          overshoot_pct: { type: 'number' },
+          jitter: { type: 'integer' },
+          settle_ms: { type: 'integer' },
+          biggest_step_at_ms: { type: 'integer' },
+          series: { type: 'string' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['message', 'source', 'peak_size_px', 'overshoot_pct', 'jitter', 'settle_ms', 'biggest_step_at_ms', 'series', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      const seconds = Math.min(12, Math.max(2, Number(args.seconds ?? 4)))
+      const fps = Math.min(10, Math.max(2, Number(args.fps ?? 8)))
+      const region = parseRegion(args.region) ?? null
+      const motion = await mirror.motion(device, { seconds, fps, region, threshold: args.threshold, force: args.force === true })
+      if (motion === null) {
+        return {
+          message: '没拿到可分析的画面：现场录屏没起来（可能侧栏直播正占着编码器），先用 adb_shot 看一眼当前画面。',
+          source: 'none', peak_size_px: 0, overshoot_pct: 0, jitter: 0, settle_ms: 0,
+          biggest_step_at_ms: 0, series: '', elapsed_ms: Date.now() - began,
+        }
+      }
+      const origin = motion.source === 'burst' ? '现场现录' : '磁盘录像（' + Math.round(motion.age_ms / 1000) + ' 秒前）'
+      const verdict = motion.jitter >= 3
+        ? '变化方向来回摆了 ' + motion.jitter + ' 次，偏抖'
+        : motion.overshoot_pct >= 30
+          ? '峰值比落点大 ' + motion.overshoot_pct + '%，回弹过头'
+          : '变化方向上没有明显抖动'
+      const message = origin + ' ' + seconds + 's / ' + fps + 'fps，' + motion.frames + ' 帧逐像素比对：'
+        + '变化外接框对角 ' + motion.peak_size_px + 'px，最大单帧跳变 ' + motion.biggest_step_px
+        + 'px（约 ' + motion.biggest_step_at_ms + 'ms 处），落点 ' + motion.tail_size_px + 'px，抖 ' + motion.jitter
+        + ' 次，' + motion.settle_ms + 'ms 后稳住 → ' + verdict + '。序列：' + motion.series.join(',')
+        + '（总 ' + (Date.now() - began) + 'ms' + (motion.record_ms > 0 ? '：录屏 ' + motion.record_ms + ' / 拉回 ' + motion.pull_ms : '') + '）'
+      return {
+        message,
+        source: motion.source,
+        peak_size_px: motion.peak_size_px,
+        overshoot_pct: motion.overshoot_pct,
+        jitter: motion.jitter,
+        settle_ms: motion.settle_ms,
+        biggest_step_at_ms: motion.biggest_step_at_ms,
+        series: motion.series.join(','),
+        elapsed_ms: Date.now() - began,
+      }
+    },
+  }), 'adb: adb_motion')
+
 
   ctx.effect(() => ctx.tools.register({
     name: 'adb_state',

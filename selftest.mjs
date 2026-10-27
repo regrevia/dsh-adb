@@ -241,4 +241,49 @@ try {
   bad('adb_anim 抛错', String(error?.message ?? error).slice(0, 80))
 }
 
+console.log('\n[22] adb_recent 来源与新鲜度')
+try {
+  const recent = await call('adb_recent', { seconds: 4 })
+  const src = String(recent.value.source ?? '')
+  const honest = ['live', 'burst', 'disk'].includes(src)
+  if (honest) ok('来源如实', `${src} / ${Math.round((recent.value.bytes ?? 0) / 1024)}KB / ${recent.ms}ms`)
+  else bad('来源没交代', JSON.stringify(recent.value).slice(0, 120))
+} catch (error) {
+  bad('adb_recent 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[23] adb_crash 崩溃现场')
+try {
+  const crash = await call('adb_crash', { package: 'com.whale.pet', lines: 20 })
+  const hasShape = typeof crash.value.crashes === 'number' && typeof crash.value.anr === 'number'
+  if (hasShape) ok('崩溃现场可读', `crashes=${crash.value.crashes} anr=${crash.value.anr} / ${crash.ms}ms`)
+  else bad('字段不对', JSON.stringify(crash.value).slice(0, 120))
+} catch (error) {
+  bad('adb_crash 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[24] adb_window 窗口层（含悬浮窗）')
+try {
+  const win = await call('adb_window', {})
+  const count = Number(win.value.windows ?? 0)
+  const hasHead = String(win.value.tree ?? '').includes('⌗')
+  if (count > 0 && hasHead) ok('窗口列表可读', `${count} 个窗口 / ${win.value.elapsed_ms}ms`)
+  else bad('窗口列表为空', JSON.stringify(win.value).slice(0, 120))
+} catch (error) {
+  bad('adb_window 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[25] adb_watch 几何采样（2 秒，不触发点击）')
+try {
+  const watchTarget = treeText.split('\n').map((line) => /"([^"]{2,})"/.exec(line)?.[1]).find(Boolean) ?? ''
+  const watch = watchTarget === ''
+    ? { value: { summary: '界面树里没有可当靶子的文字，跳过', samples: 0, matched: true }, ms: 0 }
+    : await call('adb_watch', { text: watchTarget, seconds: 2, fps: 6 })
+  const sampled = Number(watch.value.samples ?? 0) >= 0 && typeof watch.value.matched === 'boolean'
+  if (sampled) ok('采样返回', `${String(watch.value.summary ?? '').slice(0, 70)} / ${watch.ms}ms`)
+  else bad('采样字段不对', JSON.stringify(watch.value).slice(0, 120))
+} catch (error) {
+  bad('adb_watch 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
 console.log('\n=== 完成 ===\n')

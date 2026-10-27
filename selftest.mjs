@@ -187,4 +187,58 @@ try {
   bad('adb_shot 抛错', String(error?.message ?? error).slice(0, 80))
 }
 
+console.log('\n[17] adb_shot 区域裁切')
+try {
+  const full = await call('adb_shot', { scale: 0 })
+  const cut = await call('adb_shot', { region: '1200,800,640,420' })
+  const sized = cut.value.width === 640 && cut.value.height === 420
+  const smaller = cut.value.bytes < full.value.bytes / 2
+  if (sized && smaller) ok('只截一块', `${cut.value.width}x${cut.value.height} / ${Math.round(cut.value.bytes / 1024)}KB / ${cut.value.elapsed_ms}ms`)
+  else bad('区域裁切不对', `${cut.value.width}x${cut.value.height} ${cut.value.bytes}B（整屏 ${full.value.bytes}B）`)
+} catch (error) {
+  bad('adb_shot region 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[18] adb_proc 进程与内存')
+try {
+  const proc = await call('adb_proc', { package: 'com.whale.pet', lines: 12 })
+  const text = JSON.stringify(proc.value).slice(0, 4000)
+  if (text.length > 20) ok('拿到进程信息', `${text.length} 字符 / ${proc.ms}ms`)
+  else bad('进程信息为空')
+} catch (error) {
+  bad('adb_proc 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[19] adb_state 方向与前台')
+try {
+  const state = await call('adb_state')
+  const hasActivity = String(state.value.activity ?? '').length > 0
+  if (hasActivity) ok('前台 Activity', `${state.value.activity} / ${state.ms}ms`)
+  else bad('拿不到前台 Activity', JSON.stringify(state.value).slice(0, 120))
+} catch (error) {
+  bad('adb_state 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[20] adb_web 内嵌 H5（无 WebView 时应报错而不是崩）')
+try {
+  const web = await call('adb_web', { package: 'com.whale.pet', action: 'list' })
+  ok('WebView 可读', `${JSON.stringify(web.value).slice(0, 80)} / ${web.ms}ms`)
+} catch (error) {
+  ok('无 WebView 时明确报错', String(error?.message ?? error).slice(0, 80))
+}
+
+console.log('\n[21] adb_anim 动效采样（1.2 秒，不触发点击）')
+try {
+  /* 目标从第 2 段读到的界面树里挑一个真实存在的文字，避免空跑报参数错。 */
+  const animTarget = treeText.split('\n').map((line) => /"([^"]{2,})"/.exec(line)?.[1]).find(Boolean) ?? ''
+  const anim = animTarget === ''
+    ? { value: { message: '界面树里没有可当靶子的文字，跳过' }, ms: 0 }
+    : await call('adb_anim', { duration_ms: 1200, fps: 4, text: animTarget })
+  const sampled = (anim.value.samples ?? 0) > 0 || String(anim.value.message ?? '').length > 0
+  if (sampled) ok('采样返回', `${String(anim.value.message ?? '').slice(0, 60)} / ${anim.ms}ms`)
+  else bad('采样为空', JSON.stringify(anim.value).slice(0, 120))
+} catch (error) {
+  bad('adb_anim 抛错', String(error?.message ?? error).slice(0, 80))
+}
+
 console.log('\n=== 完成 ===\n')

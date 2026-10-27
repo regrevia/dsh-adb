@@ -14,7 +14,7 @@
  * @module dsh-adb
  */
 
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, open, stat, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
@@ -22,7 +22,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=142'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=143'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=114'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -1045,6 +1045,49 @@ async function pngSize(path) {
  * @param {{scale?: number, path?: string}} options - 参数。
  * @returns {Promise<{path: string, bytes: number, width: number, height: number, ms: number}>} 结果。
  */
+/**
+ * 用 ffmpeg 从整屏 JPEG 里裁一块，省掉整屏传输和解码。
+ * @param {Buffer} jpeg - 整屏 JPEG。
+ * @param {{x: number, y: number, w: number, h: number}} region - 设备像素矩形。
+ * @returns {Promise<Buffer>} 裁切后的 JPEG。
+ */
+/**
+ * 解析 "x,y,w,h"，格式不对就当没给。
+ * @param {unknown} text - 参数字符串。
+ * @returns {{x: number, y: number, w: number, h: number}|null} 矩形或 null。
+ */
+function parseRegion(text) {
+  if (typeof text !== 'string' || text.trim() === '') return null
+  const parts = text.split(',').map((piece) => Number(piece.trim()))
+  if (parts.length !== 4 || parts.some((value) => !Number.isFinite(value))) return null
+  const [x, y, w, h] = parts
+  if (w < 2 || h < 2) return null
+  return { x, y, w, h }
+}
+
+async function cropJpeg(jpeg, region) {
+  const ffmpeg = process.env.FFMPEG ?? 'ffmpeg'
+  const w = Math.max(2, Math.round(region.w))
+  const h = Math.max(2, Math.round(region.h))
+  const x = Math.max(0, Math.round(region.x))
+  const y = Math.max(0, Math.round(region.y))
+  const filter = `crop=${w}:${h}:${x}:${y}`
+  return await new Promise((resolve, reject) => {
+    const child = spawn(ffmpeg, ['-v', 'error', '-i', 'pipe:0', '-vf', filter, '-frames:v', '1', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    const out = []
+    let err = ''
+    child.stdout.on('data', (chunk) => out.push(chunk))
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk) => { err = (err + chunk).slice(-400) })
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (code === 0 && out.length > 0) resolve(Buffer.concat(out))
+      else reject(new Error(`裁切失败：${err.trim() || 'ffmpeg 退出码 ' + String(code)}`))
+    })
+    child.stdin.end(jpeg)
+  })
+}
+
 async function screenshot(serial, options) {
   const started = Date.now()
   /* 设备端直接编 JPEG：3.5MB / 0.6s，比 PNG 的 8.9MB 少一大截传输和 sips 解码时间。 */
@@ -1055,7 +1098,11 @@ async function screenshot(serial, options) {
     jpeg = false
   }
   if (!r.ok || r.raw.length === 0) throw new Error(`截图失败：${oneLine(r.err || '无输出', 160)}`)
-  const buffer = r.raw
+  let buffer = r.raw
+  if (options.region != null) {
+    buffer = await cropJpeg(buffer, options.region)
+    if (buffer.length < 100) throw new Error('裁切失败：区域超出画面？')
+  }
   const dir = join(tmpdir(), 'dsh-adb')
   await mkdir(dir, { recursive: true })
   const path = options.path || join(dir, `screen-${serial}-${Date.now()}.${jpeg ? 'jpg' : 'png'}`)
@@ -2135,6 +2182,7 @@ export function apply(ctx, config) {
       type: 'object',
       properties: {
         scale: { type: 'integer', description: '长边像素，默认 900；传 0 保留原图（2136x3200 的平板原图约 9MB）' },
+        region: { type: 'string', description: '只截这块区域，格式 "x,y,w,h"（设备像素，左上角原点）。看桌宠、小图标这类局部细节用，比整屏快也省 token' },
         path: { type: 'string', description: '保存路径（绝对路径），不写就放临时目录' },
       },
       additionalProperties: false,
@@ -2158,7 +2206,9 @@ export function apply(ctx, config) {
       const device = await serial()
       const began = Date.now()
       /* 侧栏正在直播时，最新一帧就是现在这张屏：0ms，不必再 screencap。 */
-      const live = args.scale === 0 ? null : mirror.liveFrame(device)
+      const region = parseRegion(args.region)
+      /* 直播帧是 960x640 缩过的，按它裁会错位：有 region 就老老实实抓整屏。 */
+      const live = args.scale === 0 || region !== null ? null : mirror.liveFrame(device)
       if (live !== null) {
         const dims = jpegSize(live.frame)
         if (dims !== null) {
@@ -2168,7 +2218,7 @@ export function apply(ctx, config) {
           return { path: target, bytes: live.frame.length, width: dims.w, height: dims.h, elapsed_ms: Date.now() - began }
         }
       }
-      const shot = await screenshot(device, { scale: args.scale, path: args.path })
+      const shot = await screenshot(device, { scale: args.scale, path: args.path, region })
       return { path: shot.path, bytes: shot.bytes, width: shot.width, height: shot.height, elapsed_ms: shot.ms }
     },
   }), 'adb: adb_shot')

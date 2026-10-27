@@ -2026,6 +2026,102 @@ export function apply(ctx, config) {
   }), 'adb: adb_proc')
 
   ctx.effect(() => ctx.tools.register({
+    name: 'adb_crash',
+    description: [
+      '看这台设备最近的崩溃和 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，以及 dropbox / /data/anr 里的现场文件（有 root 时）。',
+      '用户说「闪退了 / 卡死 / 白屏」而不给日志时先查这个，比让用户复述现象准；要完整堆栈再对它指向的包用 adb_sh logcat。',
+      '复现前先看一眼，复现后再看一次，多出来的就是刚才那次。',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        package: { type: 'string', description: '只看这个包名的崩溃（子串匹配，例如 com.whale.pet）' },
+        lines: { type: 'integer', description: '最多回多少行原始日志，默认 40（上限 200）' },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string' },
+          crashes: { type: 'integer' },
+          anr: { type: 'integer' },
+          elapsed_ms: { type: 'integer' },
+        },
+        required: ['message', 'crashes', 'anr', 'elapsed_ms'],
+        additionalProperties: false,
+      },
+      render: (_args, value) => textBlock(value.message),
+    },
+    execute: async (args) => {
+      const device = await serial()
+      const began = Date.now()
+      const limit = Math.min(200, Math.max(6, Number(args.lines ?? 40)))
+      const wanted = typeof args.package === 'string' ? args.package.trim() : ''
+      const parts = []
+      let crashes = 0
+      let anr = 0
+
+      /* 触发方看的是现场：crash 缓冲区在重启后清空，所以每次现读，不缓存。 */
+      const log = await adb(['-s', device, 'shell', 'logcat', '-b', 'crash', '-d', '-t', String(limit)], { timeout: 20_000 }).catch(() => null)
+      const raw = log && log.ok ? log.out.trim() : ''
+      const lines = raw === '' ? [] : raw.split('\n')
+      const picked = wanted === '' ? lines : lines.filter((line) => line.includes(wanted))
+      if (picked.length > 0) {
+        crashes = picked.filter((line) => line.includes('FATAL EXCEPTION')).length || 1
+        parts.push(`崩溃缓冲区（最后 ${picked.length} 行）`, picked.slice(-limit).join('\n'))
+      } else {
+        parts.push('崩溃缓冲区：空' + (wanted === '' ? '' : `（没有 ${wanted} 的记录）`))
+      }
+
+      /* dropbox 与 /data/anr 只有 root 能读；拿不到就明说，不假装设备没崩过。 */
+      const drop = await adb(['-s', device, 'shell', 'su', '-c', 'ls -t /data/system/dropbox 2>/dev/null | head -6'], { timeout: 15_000 }).catch(() => null)
+      const names = drop && drop.ok ? drop.out.split('\n').map((line) => line.trim()).filter((line) => /crash|anr|wtf/i.test(line)) : []
+      if (names.length > 0) {
+        /* dropbox 文件名里只有时间戳，看不出是哪个包：先按包名筛，筛不到再回落到最新一条。 */
+        let chosen = null
+        let body = ''
+        for (const name of names.slice(0, 4)) {
+          const read = await adb(['-s', device, 'shell', 'su', '-c', `head -30 /data/system/dropbox/${name} 2>/dev/null`], { timeout: 15_000 }).catch(() => null)
+          const text = read && read.ok ? read.out.trim() : ''
+          if (text === '') continue
+          if (chosen === null) {
+            chosen = name
+            body = text
+          }
+          if (wanted === '' || text.includes(wanted)) {
+            chosen = name
+            body = text
+            break
+          }
+        }
+        if (chosen !== null && (wanted === '' || body.includes(wanted))) {
+          crashes = Math.max(crashes, 1)
+          parts.push(`dropbox 现场：${chosen}`, body.slice(0, 2500))
+        } else if (chosen !== null) {
+          parts.push(`dropbox 里有 ${names.length} 个崩溃文件，但都不是 ${wanted}`, body.slice(0, 600))
+        }
+      } else {
+        parts.push('dropbox：没有 crash/anr 文件（或没有 root）')
+      }
+
+      const traces = await adb(['-s', device, 'shell', 'su', '-c', 'ls -t /data/anr 2>/dev/null | head -3'], { timeout: 15_000 }).catch(() => null)
+      const files = traces && traces.ok ? traces.out.split('\n').map((line) => line.trim()).filter(Boolean) : []
+      if (files.length > 0) {
+        anr = files.length
+        const top = await adb(['-s', device, 'shell', 'su', '-c', `head -25 /data/anr/${files[0]} 2>/dev/null`], { timeout: 15_000 }).catch(() => null)
+        parts.push(`ANR 现场：${files.join(', ')}`, (top && top.ok ? top.out : '').trim().slice(0, 1800))
+      } else {
+        parts.push('ANR：没有 /data/anr 现场文件')
+      }
+
+      parts.push(`提示：想抓下一次崩溃，先 adb_sh 跑 logcat -c 清缓冲，复现后再调本工具。`)
+      return { message: parts.join('\n\n'), crashes, anr, elapsed_ms: Date.now() - began }
+    },
+  }), 'adb: adb_crash')
+
+  ctx.effect(() => ctx.tools.register({
     name: 'adb_web',
     description: [
       '直读 App 里 WebView 的 DOM（走 devtools 协议，比文本树准）：list 列页面，dom 按选择器取元素矩形与文字，eval 跑一段 JS。',

@@ -99,6 +99,7 @@ cd dsh-adb
 | `adb_state` | 一次往返：前台 Activity、焦点窗口、窗口栈、键盘、方向、分辨率、亮屏、电量、root（262–376 ms） |
 | `adb_do` | 一串动作一次跑完（最多 20 步）：点 / 滑 / 输入 / 按键 / 系统动作 / 等文字，任何一步失败就停并报第几步 |
 | `adb_action` | 系统动作一条命令：`home` / `back` / `recents` / `lock` / `wake` / `rotate` / `notifications` / `quick_settings` / `night_mode` |
+| `adb_crash` | 最近的崩溃与 ANR：FATAL EXCEPTION 摘要、进程名、首段堆栈，外加 dropbox / `/data/anr` 现场（有 root 时）；用户只说「闪退了」时先查它 |
 | `adb_recent` | 最近几秒 6 帧拼图（读本地环形录像，不碰设备）：动效比例/位移/卡顿这类单帧看不出的问题用它 |
 | `adb_mirror` | 侧栏「实时ADB」：低帧率直播 + 手点 + 圈选推回会话；`status` / `peek` / `recent` / `stop` |
 

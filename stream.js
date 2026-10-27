@@ -209,6 +209,9 @@ function containsIdr(chunk) {
   return false
 }
 
+/** 最后一个观众走后，录屏再活这么久：侧栏重载/切页回来时能立刻出画面，不用等 2 秒起流。 */
+const IDLE_GRACE_MS = 20000
+
 export class LiveStream {
   /**
    * @param {{serial: string, adb: string, width?: number, height?: number, bitrate?: number}} options - 设备与画质。
@@ -242,15 +245,30 @@ export class LiveStream {
     this.config = null
     this.error = ''
     this.intentional = false
+    this.idleTimer = null
     this.firstFrameAt = 0
     this.bytes = 0
     this.framesSeen = 0
     this.lastAt = 0
   }
 
+  /** 观众都走了：留一段宽限再停，重开侧栏就不用重新起流。 @returns {void} */
+  scheduleIdleStop() {
+    if (this.idleTimer !== null) return
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null
+      if (this.clients.size === 0 && this.waiting.size === 0) this.stop()
+    }, IDLE_GRACE_MS)
+    this.idleTimer.unref?.()
+  }
+
   /** 有人在看才开始录，没人看一会儿就停，省设备电和带宽。 @returns {void} */
   start() {
     if (this.stopping || this.spawning) return
+    if (this.idleTimer !== null) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = null
+    }
     if (this.recorder !== null) {
       this.ensureRemuxer()
       return
@@ -558,7 +576,7 @@ export class LiveStream {
     return () => {
       this.clients.delete(sink)
       this.waiting.delete(sink)
-      if (this.clients.size === 0 && this.waiting.size === 0) this.stop()
+      if (this.clients.size === 0 && this.waiting.size === 0) this.scheduleIdleStop()
     }
   }
 
@@ -578,6 +596,10 @@ export class LiveStream {
 
   /** 没人看了就停，别占着设备编码器。 @returns {void} */
   stop() {
+    if (this.idleTimer !== null) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = null
+    }
     this.stopping = true
     if (this.restartTimer !== null) {
       clearTimeout(this.restartTimer)

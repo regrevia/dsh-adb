@@ -10,6 +10,9 @@
  */
 
 import { spawn } from 'node:child_process'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 /** 帧类型：0 文本元信息，1 初始化段，2 媒体分片，3 一条流结束（前端应重连）。 */
 export const FRAME_META = 0
@@ -238,6 +241,7 @@ export class LiveStream {
     this.sessions = 0
     this.config = null
     this.error = ''
+    this.intentional = false
     this.firstFrameAt = 0
     this.bytes = 0
     this.framesSeen = 0
@@ -246,13 +250,15 @@ export class LiveStream {
 
   /** 有人在看才开始录，没人看一会儿就停，省设备电和带宽。 @returns {void} */
   start() {
-    if (this.stopping) return
+    if (this.stopping || this.spawning) return
     if (this.recorder !== null) {
       this.ensureRemuxer()
       return
     }
     this.startedAt = Date.now()
+    this.spawning = true
     this.spawnRecorder()
+    this.spawning = false
   }
 
   /**
@@ -261,9 +267,11 @@ export class LiveStream {
    */
   rekey() {
     if (this.stopping) return
+    this.intentional = true
     const child = this.recorder
     this.recorder = null
     this.init = null
+    this.error = ''
     this.lastKeyChunks = []
     this.closeRemuxer()
     if (child !== null) {
@@ -273,10 +281,38 @@ export class LiveStream {
         /* 已经退了 */
       }
     }
-    this.spawnRecorder()
+    /* 不在这里直接 spawn：旧进程还没退，同时起两个会撞上另一个录屏在跑。
+       exit 回调里的 scheduleRestart 会在 120 ms 后换新 IDR。 */
+  }
+
+  /**
+   * 设备端兜底清理：本地 adb 被杀掉后，设备上的 screenrecord 还会活到 time-limit，
+   * 占着编码器让下一次录屏直接失败（another recording is running）。
+   * @returns {void}
+   */
+  killStale() {
+    try {
+      const child = spawn(this.adbPath, ['-s', this.serial, 'shell', 'pkill -f screenrecord'], { stdio: 'ignore' })
+      child.on('error', () => {})
+      child.unref?.()
+    } catch {
+      /* 清理失败不影响主流程 */
+    }
   }
 
   /** 起一次录屏。 @returns {void} */
+  debug(note) {
+    /* 常开：只在开/停录屏时写一行，量极小，出问题不用再复现一次。 */
+    try {
+      const line = JSON.stringify({ at: Date.now(), serial: this.serial, note, sessions: this.sessions, clients: this.clients.size, waiting: this.waiting.size, err: this.error }) + '\n'
+      mkdirSync(join(homedir(), '.dsh', 'adb-mirror'), { recursive: true })
+      mkdirSync(join(homedir(), '.dsh', 'adb-mirror'), { recursive: true })
+      appendFileSync(join(homedir(), '.dsh', 'adb-mirror', 'stream-debug.log'), line)
+    } catch {
+      /* 调试失败不影响推流 */
+    }
+  }
+
   spawnRecorder() {
     if (this.stopping) return
     const size = `${this.width}x${this.height}`
@@ -291,6 +327,7 @@ export class LiveStream {
     const child = spawn(this.adbPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     this.recorder = child
     this.sessions += 1
+    this.debug('spawn')
     let stderr = ''
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk) => {
@@ -306,13 +343,17 @@ export class LiveStream {
       if (this.recorder === child) this.recorder = null
       this.closeRemuxer()
       if (this.stopping) return
-      if (code !== 0 && stderr.trim() !== '') {
+      const wasIntentional = this.intentional
+      this.intentional = false
+      this.debug('recorder-exit code=' + String(code) + ' intentional=' + String(wasIntentional) + ' stderr=' + stderr.trim().slice(-120))
+      if (code !== 0 && stderr.trim() !== '' && !wasIntentional) {
         /* screenrecord 在一些机型上会因为「另一个录屏在跑」直接退出，记下来便于排查。 */
         const text = stderr.trim().split('\n').slice(-2).join(' ')
         if (/denied|error|failed|another/i.test(text)) this.error = text
       }
       /* 正常到时长或编码器重启都走这里：换一份 moov，前端按 INIT 帧重建 MediaSource。 */
       if (this.clients.size > 0) this.broadcast(packFrame(FRAME_END, Buffer.alloc(0)))
+      if (wasIntentional && this.stopping) return
       this.scheduleRestart()
     })
   }
@@ -320,10 +361,14 @@ export class LiveStream {
   /** 到点自动续上，避免中断超过半秒。 @returns {void} */
   scheduleRestart() {
     if (this.stopping || this.restartTimer !== null) return
-    if (this.clients.size === 0) return
+    if (this.clients.size === 0 && this.waiting.size === 0) return
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null
-      if (!this.stopping && this.clients.size > 0) this.spawnRecorder()
+      if (!this.stopping && (this.clients.size > 0 || this.waiting.size > 0)) {
+        /* 上一轮可能是被 SIGKILL 的 adb：先清掉设备端残留，再开新录屏。 */
+        if (this.sessions > 0) this.killStale()
+        this.spawnRecorder()
+      }
     }, 120)
     this.restartTimer.unref?.()
   }
@@ -386,7 +431,10 @@ export class LiveStream {
     })
     child.on('exit', (code) => {
       if (this.remuxer === child) this.remuxer = null
-      if (code !== 0 && this.error === '') this.error = `ffmpeg 退出码 ${String(code)}`
+      /* 我们主动 kill 时 code 是 null，不是故障。 */
+    this.debug('ffmpeg-exit code=' + String(code) + ' stopping=' + String(this.stopping) + ' intentional=' + String(this.intentional))
+    /* code=null 表示被信号杀掉，是我们自己的 kill，不是故障。 */
+    if (code !== 0 && code !== null && this.error === '' && !this.stopping && !this.intentional) this.error = `ffmpeg 退出码 ${String(code)}`
     })
   }
 
@@ -503,7 +551,8 @@ export class LiveStream {
       /* 手上没有能解码的起点，先挂着，下一张 IDR 到了再补，避免解码器起不来。 */
       this.waiting.add(sink)
       /* 设备只在开录时给一张 IDR，等下一张可能是几十秒；直接重开一次录屏换新 IDR。 */
-      if (this.recorder !== null && this.restartTimer === null) this.rekey()
+      /* 刚起的录屏还没吐第一张 IDR 就别杀掉重开：等它自己出图。 */
+      if (this.recorder !== null && this.restartTimer === null && Date.now() - this.startedAt > 700) this.rekey()
       this.sendPrelude(sink)
     }
     return () => {
@@ -544,7 +593,10 @@ export class LiveStream {
         /* 已经退了 */
       }
     }
+    this.intentional = true
     this.stopping = false
+    /* 本地杀进程不等于设备端停了：显式收掉，否则下一次开流会撞上另一个录屏在跑。 */
+    if (this.sessions > 0) this.killStale()
     this.init = null
     this.lastKeyChunks = []
     this.waiting.clear()

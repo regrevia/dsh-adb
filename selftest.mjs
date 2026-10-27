@@ -110,7 +110,7 @@ ok('两步一次跑完', `${batch.value.steps} 步 / ${batch.ms}ms`)
 
 console.log('\n[13] 推流接口（/stream/info + /stream 3 秒）')
 /* 宿主端口会变：从环境变量取，默认当前的 GUI 端口。 */
-const base = process.env.DSH_ADB_BASE ?? 'http://127.0.0.1:50802/dsh-adb'
+const base = process.env.DSH_ADB_BASE ?? 'http://127.0.0.1:' + (process.env.DSH_PORT ?? '55409') + '/dsh-adb'
 const info = await fetch(`${base}/stream/info?serial=${encodeURIComponent(device.value.serial)}`).then((res) => res.json()).catch(() => null)
 if (info === null) bad('拿不到 /stream/info')
 else ok('/stream/info 可读', `codec=${info.codec || '(未开)'} clients=${info.clients}`)

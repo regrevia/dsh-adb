@@ -22,7 +22,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { setupMirror, frameSize as jpegSize } from './mirror.js?v=143'
+import { setupMirror, frameSize as jpegSize } from './mirror.js?v=144'
 import { ocrAvailable, ocrImage, stopOcr, toRects } from './ocr.js?v=114'
 
 /** Plugin name，与 bundle patch 里的行 id 对应。 */
@@ -2639,6 +2639,7 @@ ctx.effect(() => ctx.tools.register({
         seconds: { type: 'integer', description: '回看几秒，默认 4（2–12）' },
         fps: { type: 'integer', description: '抽帧帧率，默认 8（2–10）' },
         region: { type: 'string', description: '只看这一块，格式 "x,y,w,h"（设备像素），例如桌宠所在角落' },
+        target: { type: 'string', description: '按控件自动定区域：给文字/资源 id 子串，自动取它的框（比手算坐标准）' },
         threshold: { type: 'integer', description: '像素差阈值，默认 12（2–64）；屏幕有噪点/渐变时调高' },
         force: { type: 'boolean', description: '不管有没有近的磁盘录像，都现在录一段再量（复现/对比时用，多花约 4 秒）' },
       },
@@ -2654,11 +2655,15 @@ ctx.effect(() => ctx.tools.register({
           overshoot_pct: { type: 'number' },
           jitter: { type: 'integer' },
           settle_ms: { type: 'integer' },
+          changed_frames: { type: 'integer' },
+          real_fps: { type: 'number' },
+          region_used: { type: 'string' },
+          metric: { type: 'string' },
           biggest_step_at_ms: { type: 'integer' },
           series: { type: 'string' },
           elapsed_ms: { type: 'integer' },
         },
-        required: ['message', 'source', 'peak_size_px', 'overshoot_pct', 'jitter', 'settle_ms', 'biggest_step_at_ms', 'series', 'elapsed_ms'],
+        required: ['message', 'source', 'peak_size_px', 'overshoot_pct', 'jitter', 'settle_ms', 'changed_frames', 'real_fps', 'region_used', 'biggest_step_at_ms', 'series', 'elapsed_ms'],
         additionalProperties: false,
       },
       render: (_args, value) => textBlock(value.message),
@@ -2668,25 +2673,71 @@ ctx.effect(() => ctx.tools.register({
       const began = Date.now()
       const seconds = Math.min(12, Math.max(2, Number(args.seconds ?? 4)))
       const fps = Math.min(10, Math.max(2, Number(args.fps ?? 8)))
-      const region = parseRegion(args.region) ?? null
+      let region = parseRegion(args.region) ?? null
+      let regionNote = region === null ? '全屏' : '区域 ' + region.w + '×' + region.h + ' @' + region.x + ',' + region.y
+      const target = typeof args.target === 'string' ? args.target.trim() : ''
+      if (region === null && target !== '') {
+        const needle = target.toLowerCase()
+        const node = parseNodes(await u2Dump(device)).find((each) =>
+          (each.text !== '' && each.text.toLowerCase().includes(needle))
+          || (each.id !== '' && each.id.toLowerCase().includes(needle))
+          || (each.desc !== '' && each.desc.toLowerCase().includes(needle))) ?? null
+        if (node === null) {
+          return {
+            message: '没找到「' + target + '」这个控件，分析区域没设成。先用 adb_ui 看当前界面的文字，或直接给 region="x,y,w,h"。',
+            source: 'none', peak_size_px: 0, overshoot_pct: 0, jitter: 0, settle_ms: -1,
+            changed_frames: 0, real_fps: 0, region_used: '', metric: 'diag',
+            biggest_step_at_ms: 0, series: '', elapsed_ms: Date.now() - began,
+          }
+        }
+        const nodeW = node.x2 - node.x1
+        const nodeH = node.y2 - node.y1
+        const pad = Math.round(Math.max(nodeW, nodeH) * 0.1)
+        region = { x: Math.max(0, node.x1 - pad), y: Math.max(0, node.y1 - pad), w: nodeW + pad * 2, h: nodeH + pad * 2 }
+        regionNote = '控件「' + (node.text || node.id.split('/').pop()) + '」 ' + nodeW + '×' + nodeH + ' @' + node.x1 + ',' + node.y1
+      }
       const motion = await mirror.motion(device, { seconds, fps, region, threshold: args.threshold, force: args.force === true })
       if (motion === null) {
         return {
           message: '没拿到可分析的画面：现场录屏没起来（可能侧栏直播正占着编码器），先用 adb_shot 看一眼当前画面。',
-          source: 'none', peak_size_px: 0, overshoot_pct: 0, jitter: 0, settle_ms: 0,
+          source: 'none', peak_size_px: 0, overshoot_pct: 0, jitter: 0, settle_ms: -1,
+          changed_frames: 0, real_fps: 0, region_used: regionNote, metric: 'diag',
           biggest_step_at_ms: 0, series: '', elapsed_ms: Date.now() - began,
         }
       }
       const origin = motion.source === 'burst' ? '现场现录' : '磁盘录像（' + Math.round(motion.age_ms / 1000) + ' 秒前）'
-      const verdict = motion.jitter >= 3
-        ? '变化方向来回摆了 ' + motion.jitter + ' 次，偏抖'
-        : motion.overshoot_pct >= 30
-          ? '峰值比落点大 ' + motion.overshoot_pct + '%，回弹过头'
-          : '变化方向上没有明显抖动'
-      const message = origin + ' ' + seconds + 's / ' + fps + 'fps，' + motion.frames + ' 帧逐像素比对：'
-        + '变化外接框对角 ' + motion.peak_size_px + 'px，最大单帧跳变 ' + motion.biggest_step_px
-        + 'px（约 ' + motion.biggest_step_at_ms + 'ms 处），落点 ' + motion.tail_size_px + 'px，抖 ' + motion.jitter
-        + ' 次，' + motion.settle_ms + 'ms 后稳住 → ' + verdict + '。序列：' + motion.series.join(',')
+      const cadence = '抽 ' + motion.frames + ' 帧，变化 ' + motion.changed_frames + ' 帧（有效 ' + motion.real_fps + ' fps）'
+      if (motion.changed_frames < 2) {
+        return {
+          message: origin + ' ' + seconds + 's，' + regionNote + '，' + cadence + '：这几秒画面基本没动。'
+            + '静态界面、或动画不在这一块；要看控件几何用 adb_watch，要看整屏用 adb_shot。',
+          source: motion.source, peak_size_px: 0, overshoot_pct: 0, jitter: 0, settle_ms: -1,
+          changed_frames: motion.changed_frames, real_fps: motion.real_fps, region_used: regionNote, metric: 'diag',
+          biggest_step_at_ms: 0, series: '', elapsed_ms: Date.now() - began,
+        }
+      }
+      /* 只有两三帧在动时，峰值/落点之比没有统计意义（15600% 这种数会误导人）：
+         先看证据够不够，再下结论。 */
+      const solid = motion.chained_frames >= 4 && motion.tail_size_px >= 12 && motion.peak_size_px >= 20
+      const verdict = !solid
+        ? '变化帧太少或幅度太小，判不出抖动/回弹（只看到最大单帧跳了 ' + motion.biggest_step_px + 'px）'
+        : motion.jitter >= 3
+          ? '变化方向来回摆了 ' + motion.jitter + ' 次，偏抖'
+          : motion.overshoot_pct >= 30
+            ? '峰值比落点大 ' + motion.overshoot_pct + '%，回弹过头'
+            : '变化方向上没有明显抖动'
+      const settle = motion.settle_ms >= 0
+        ? '末尾 ' + motion.settle_ms + 'ms 没再变（已稳住）'
+        : '末尾仍在变（截到动画中途，可加 force 再录一段）'
+      const chainNote = motion.chained_frames >= 2
+        ? '主链路 ' + motion.chained_frames + ' 帧'
+        : '没有连成一条的变化（各处各动一下）'
+      const sizeLabel = motion.metric === 'reach' ? '外缘半径' : '变化外接框对角'
+      const message = origin + ' ' + seconds + 's，' + regionNote + '，' + cadence + '，逐像素比对：'
+        + chainNote + '，' + sizeLabel + ' ' + motion.peak_size_px + 'px（峰值，落点 ' + motion.tail_size_px + 'px），最大单帧跳变 ' + motion.biggest_step_px
+        + 'px（约 ' + motion.biggest_step_at_ms + 'ms 处），' + settle
+        + '，抖 ' + motion.jitter + ' 次 → ' + verdict + '。'
+        + (motion.region === null ? '（全屏统计，多处动效会混在一起；要看某一处就传 target 或 region）' : '')
         + '（总 ' + (Date.now() - began) + 'ms' + (motion.record_ms > 0 ? '：录屏 ' + motion.record_ms + ' / 拉回 ' + motion.pull_ms : '') + '）'
       return {
         message,
@@ -2695,6 +2746,10 @@ ctx.effect(() => ctx.tools.register({
         overshoot_pct: motion.overshoot_pct,
         jitter: motion.jitter,
         settle_ms: motion.settle_ms,
+        changed_frames: motion.changed_frames,
+        real_fps: motion.real_fps,
+        region_used: regionNote,
+        metric: motion.metric ?? 'diag',
         biggest_step_at_ms: motion.biggest_step_at_ms,
         series: motion.series.join(','),
         elapsed_ms: Date.now() - began,

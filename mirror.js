@@ -521,7 +521,8 @@ export class Mirror {
       const duration = await probeDuration(file)
       if (age < 15_000 && duration >= Math.min(seconds, 1)) return { file, source: 'disk', ageMs: age, temp: false }
     }
-    const burst = await this.captureBurst(seconds + 1)
+    /* 录多 1 秒会给屏录进程多留 1 秒启动开销，末尾取 frame 时本来只要 seconds 秒 */
+    const burst = await this.captureBurst(Math.min(12, seconds))
     if (burst !== null) return { file: burst, source: 'burst', ageMs: 0, temp: true }
     if (list.length === 0) return null
     const last = list[list.length - 1]
@@ -542,30 +543,109 @@ export class Mirror {
     const clip = await this.recentClip(seconds, options.force === true)
     if (clip === null) return null
     try {
-      const gray = await grayFrames(clip.file, seconds, fps, region)
-      if (gray === null) return null
-      const scale = region !== null && region.w > 0 ? region.w / gray.w : null
       const size = await probeVideoSize(clip.file)
-      const factor = scale ?? (size === null ? 1 : size.w / gray.w)
+      /* region 是设备像素坐标，录像只有 960x640：先按比例换到视频坐标再裁，
+         否则 crop 越界，ffmpeg 一帧都不给，看起来像「录屏没起来」。 */
+      const screen = this.screen !== undefined && this.screen.w > 0 ? this.screen : size
+      const crop = region !== null && screen !== null && size !== null && region.w > 0 && region.h > 0
+        ? {
+            x: Math.max(0, Math.min(size.w - 2, Math.round((region.x / screen.w) * size.w))),
+            y: Math.max(0, Math.min(size.h - 2, Math.round((region.y / screen.h) * size.h))),
+            w: 0,
+            h: 0,
+          }
+        : null
+      if (crop !== null) {
+        crop.w = Math.max(2, Math.min(size.w - crop.x, Math.round((region.w / screen.w) * size.w)))
+        crop.h = Math.max(2, Math.min(size.h - crop.y, Math.round((region.h / screen.h) * size.h)))
+      }
+      const gray = await grayFrames(clip.file, seconds, fps, crop)
+      if (gray === null) return null
+      const factor = crop !== null ? region.w / gray.w : (screen === null ? 1 : screen.w / gray.w)
       const frames = []
       const series = []
+      const reaches = []
       for (let index = 1; index < gray.bytes.length; index += 1) {
         const before = gray.bytes[index - 1]
         const after = gray.bytes[index]
-        let changed = 0
-        let minX = gray.w
-        let minY = gray.h
-        let maxX = -1
-        let maxY = -1
+        const width = gray.w
+        const height = gray.h
+        const mask = new Uint8Array(after.length)
+        let scattered = 0
         for (let at = 0; at < after.length; at += 1) {
           if (Math.abs(after[at] - before[at]) <= threshold) continue
-          changed += 1
-          const x = at % gray.w
-          const y = (at - x) / gray.w
-          if (x < minX) minX = x
-          if (x > maxX) maxX = x
-          if (y < minY) minY = y
-          if (y > maxY) maxY = y
+          mask[at] = 1
+          scattered += 1
+        }
+        let area = 0
+        let outer = 0
+        let blobs = 0
+        let minX = width
+        let minY = height
+        let maxX = -1
+        let maxY = -1
+        if (crop !== null) {
+          /* 已经圈到某一处（例如桌宠）时，变化就是这一件事本身：
+             取全部变化像素的外接框，别做连通块拆分，否则壳/嘴/气泡各算一块，
+             框在帧间来回跳，会把「整体变大」误读成抖动。 */
+          area = scattered
+          let sumX = 0
+          let sumY = 0
+          for (let at = 0; at < mask.length; at += 1) {
+            if (mask[at] !== 1) continue
+            const x = at % width
+            const y = (at - x) / width
+            sumX += x
+            sumY += y
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+          }
+          if (scattered > 0) {
+            const cx = sumX / scattered
+            const cy = sumY / scattered
+            for (let at = 0; at < mask.length; at += 1) {
+              if (mask[at] !== 1) continue
+              const x = at % width
+              const y = (at - x) / width
+              const reach = Math.max(Math.abs(x - cx), Math.abs(y - cy))
+              if (reach > outer) outer = reach
+            }
+          }
+          blobs = scattered > 0 ? 1 : 0
+        } else {
+          /* 全屏时时钟、状态栏、各处动效各变各的，混成一个外接框会得到假抖动：
+             只认最大的一团。 */
+          const stack = new Int32Array(after.length)
+          for (let seed = 0; seed < mask.length; seed += 1) {
+            if (mask[seed] !== 1) continue
+            blobs += 1
+            let top = 0
+            let size = 0
+            let left = width
+            let right = -1
+            let up = height
+            let down = -1
+            stack[0] = seed
+            top = 1
+            mask[seed] = 2
+            while (top > 0) {
+              const cur = stack[--top]
+              const x = cur % width
+              const y = (cur - x) / width
+              size += 1
+              if (x < left) left = x
+              if (x > right) right = x
+              if (y < up) up = y
+              if (y > down) down = y
+              if (x > 0 && mask[cur - 1] === 1) { mask[cur - 1] = 2; stack[top++] = cur - 1 }
+              if (x < width - 1 && mask[cur + 1] === 1) { mask[cur + 1] = 2; stack[top++] = cur + 1 }
+              if (y > 0 && mask[cur - width] === 1) { mask[cur - width] = 2; stack[top++] = cur - width }
+              if (y < height - 1 && mask[cur + width] === 1) { mask[cur + width] = 2; stack[top++] = cur + width }
+            }
+            if (size > area) { area = size; minX = left; minY = up; maxX = right; maxY = down }
+          }
         }
         const boxed = maxX >= minX && maxY >= minY
         const box = boxed
@@ -573,40 +653,104 @@ export class Mirror {
           : { x: 0, y: 0, w: 0, h: 0 }
         const frame = {
           t: Math.round((index / fps) * 1000),
-          changed_pct: Number(((changed / after.length) * 100).toFixed(2)),
+          changed_pct: Number(((area / after.length) * 100).toFixed(2)),
+          scattered_pct: Number(((scattered / after.length) * 100).toFixed(2)),
+          blobs,
           box,
+          reach: Math.round(outer * factor),
+          dup: area === 0,
         }
         frames.push(frame)
+        reaches.push(Math.round(outer * factor))
         series.push(box.w === 0 && box.h === 0 ? 0 : Math.round(Math.sqrt((box.w * box.w) + (box.h * box.h))))
       }
-      const peak = Math.max(...series, 0)
-      const tail = series.length > 0 ? series[series.length - 1] : 0
+      /* 画面静止时 screenrecord 按内容驱动只有约 1 帧/秒，抽到 8fps 会有大量重复帧：
+         重复帧不算「一次变化」，否则 0 帧差会被当成一次反向抖动。
+         变化再按空间切链：相邻变化帧外接框不重叠 = 另一处在动，重开一条链，
+         峰值/回弹/抖动只在最长的那条链上算，避免全屏里多处动效互相污染。 */
+      const chains = []
+      let chain = null
+      let previousBox = null
+      for (let index = 0; index < frames.length; index += 1) {
+        const frame = frames[index]
+        if (frame.dup) { chain = null; previousBox = null; continue }
+        const box = frame.box
+        const touched = previousBox !== null
+          && Math.min(previousBox.x + previousBox.w, box.x + box.w) > Math.max(previousBox.x, box.x)
+          && Math.min(previousBox.y + previousBox.h, box.y + box.h) > Math.max(previousBox.y, box.y)
+        if (!touched) { chain = null; previousBox = box }
+        if (chain === null) {
+          chain = { diags: [], steps: [] }
+          chains.push(chain)
+          chain.diags.push(Math.round(Math.sqrt((box.w * box.w) + (box.h * box.h))))
+        } else {
+          const now = Math.round(Math.sqrt((box.w * box.w) + (box.h * box.h)))
+          const was = chain.diags[chain.diags.length - 1]
+          chain.diags.push(now)
+          chain.steps.push(now - was)
+          previousBox = box
+        }
+      }
+      let focus = null
+      /* 圈定了区域（例如桌宠）时，衡量「大小」用外缘半径：变化圈往外涨=变大，往里收=变小。
+         全屏没法这么算（各处距离同一个圆心没有意义），仍用最大连通块的外接框对角。 */
+      let metric = "diag"
+      if (crop !== null) {
+        metric = "reach"
+        const values = []
+        const steps = []
+        for (let index = 0; index < reaches.length; index += 1) {
+          if (frames[index].dup) continue
+          if (values.length > 0) steps.push(reaches[index] - values[values.length - 1])
+          values.push(reaches[index])
+        }
+        focus = { diags: values, steps }
+      } else {
+        for (const each of chains) if (focus === null || each.diags.length >= focus.diags.length) focus = each
+      }
+      const focusDiags = focus === null ? [] : focus.diags
+      const peak = focusDiags.length > 0 ? Math.max(...focusDiags) : 0
+      const tail = focusDiags.length > 0 ? focusDiags[focusDiags.length - 1] : 0
+      const chainPeak = peak
       let jitter = 0
       let previousSign = 0
       let biggestStep = 0
       let biggestStepAt = 0
-      for (let index = 1; index < series.length; index += 1) {
-        const delta = series[index] - series[index - 1]
-        if (Math.abs(delta) >= Math.max(2, peak * 0.08)) {
-          const sign = Math.sign(delta)
-          if (previousSign !== 0 && sign !== previousSign) jitter += 1
-          previousSign = sign
+      if (focus !== null) {
+        for (let index = 0; index < focus.steps.length; index += 1) {
+          const delta = focus.steps[index]
+          if (Math.abs(delta) >= Math.max(4, chainPeak * 0.1)) {
+            const sign = Math.sign(delta)
+            if (previousSign !== 0 && sign !== previousSign) jitter += 1
+            previousSign = sign
+          }
+          if (Math.abs(delta) > biggestStep) { biggestStep = Math.abs(delta); biggestStepAt = index }
         }
-        if (Math.abs(delta) > biggestStep) { biggestStep = Math.abs(delta); biggestStepAt = index }
       }
-      let settleMs = 0
-      if (peak > 0) {
-        const calmAt = series.findIndex((value, index) => index > 1 && Math.abs(value - tail) <= Math.max(2, peak * 0.06))
-        settleMs = calmAt > 0 ? Math.round(((calmAt - biggestStepAt) / fps) * 1000) : 0
-        if (settleMs < 0) settleMs = 0
+      /* settle：末尾连续重复帧的长度就是「已经稳住多久」；末尾还在变就返回 -1，别硬报 0。 */
+      let settleMs = -1
+      if (series.length > 0) {
+        let trailing = 0
+        for (let index = frames.length - 1; index >= 1; index -= 1) {
+          if (!frames[index].dup) break
+          trailing += 1
+        }
+        if (trailing > 0) settleMs = Math.round((trailing / fps) * 1000)
       }
+      const liveCount = frames.filter((frame) => !frame.dup).length
       return {
         source: clip.source,
         age_ms: clip.ageMs,
         record_ms: this.lastBurstTiming?.record_ms ?? 0,
         pull_ms: this.lastBurstTiming?.pull_ms ?? 0,
         fps,
+        real_fps: Number((liveCount / seconds).toFixed(1)),
         frames: frames.length,
+        changed_frames: liveCount,
+        chained_frames: focus === null ? 0 : focus.diags.length,
+        metric,
+        region: region === null ? null : { x: region.x, y: region.y, w: region.w, h: region.h },
+        duplicates: frames.length - liveCount,
         device: size === null ? null : { w: size.w, h: size.h },
         peak_size_px: peak,
         tail_size_px: tail,
@@ -615,7 +759,7 @@ export class Mirror {
         biggest_step_at_ms: Math.round(((biggestStepAt + 1) / fps) * 1000),
         jitter,
         settle_ms: settleMs,
-        series,
+        series: metric === "reach" && focus !== null ? focus.diags : series,
         timeline: frames,
       }
     } finally {
